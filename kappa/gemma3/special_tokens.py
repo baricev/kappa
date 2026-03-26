@@ -8,3 +8,5 @@ GEMMA3_PAD = 0
 GEMMA3_EOS = 1
 GEMMA3_BOS = 2
 GEMMA3_UNK = 3
+# ``<end_of_turn>`` as a single SentencePiece token (verify with ``tokenizer.model`` if you change tokenizer).
+GEMMA3_END_OF_TURN = 106

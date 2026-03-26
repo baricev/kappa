@@ -76,6 +76,11 @@ def _parse_args() -> argparse.Namespace:
             "0 = one scan for all decode steps."
         ),
     )
+    p.add_argument(
+        "--no-early-stop",
+        action="store_true",
+        help="Do not stop at EOS / <end_of_turn> (run up to --max-new-tokens every time).",
+    )
     return p.parse_args()
 
 
@@ -165,6 +170,7 @@ def main() -> None:
     print(f"Prompt ({plen} tokens): {args.prompt!r}", flush=True)
     rng = jax.random.key(args.seed)
     decode_chunk = None if args.decode_chunk_size <= 0 else args.decode_chunk_size
+    stop_ids: tuple[int, ...] | None = () if args.no_early_stop else None
     out = generate(
         rng,
         prompt,
@@ -175,6 +181,7 @@ def main() -> None:
         max_cache_len=max_len,
         temperature=0.0,
         decode_scan_chunk_size=decode_chunk,
+        stop_token_ids=stop_ids,
     )
     out_ids = out[0].tolist()
     text = _decode_generated(sp, out_ids, plen, eos_id=GEMMA3_EOS)
