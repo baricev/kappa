@@ -66,6 +66,16 @@ def _parse_args() -> argparse.Namespace:
             "recommended for instruction-tuned checkpoints"
         ),
     )
+    p.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=128,
+        metavar="N",
+        help=(
+            "Split decode jax.lax.scan into chunks of N steps (barriers help JAX MPS). "
+            "0 = one scan for all decode steps."
+        ),
+    )
     return p.parse_args()
 
 
@@ -154,6 +164,7 @@ def main() -> None:
 
     print(f"Prompt ({plen} tokens): {args.prompt!r}", flush=True)
     rng = jax.random.key(args.seed)
+    decode_chunk = None if args.decode_chunk_size <= 0 else args.decode_chunk_size
     out = generate(
         rng,
         prompt,
@@ -163,6 +174,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         max_cache_len=max_len,
         temperature=0.0,
+        decode_scan_chunk_size=decode_chunk,
     )
     out_ids = out[0].tolist()
     text = _decode_generated(sp, out_ids, plen, eos_id=GEMMA3_EOS)

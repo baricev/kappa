@@ -23,6 +23,7 @@ jit_generate = jax.jit(
         "top_k",
         "top_p",
         "pad_token_id",
+        "decode_scan_chunk_size",
     ),
 )
 

@@ -32,6 +32,7 @@ def generate(
     top_k: int = -1,
     top_p: float = 1.0,
     pad_token_id: int = 0,
+    decode_scan_chunk_size: int | None = 128,
 ) -> Array:
     """Generate up to ``max_new_tokens`` new tokens after ``prompt_tokens`` (``[B, L]``).
 
@@ -42,6 +43,11 @@ def generate(
     blindly ``[:, -1]`` — for the first sampled token.
 
     Decode steps advance a **per-row** position vector (supports batched right-padded prompts).
+
+    ``decode_scan_chunk_size``: split the autoregressive ``jax.lax.scan`` over decode steps into
+    multiple scans of at most this length (Python loop between chunks). Same math as one long scan;
+    helps JAX MPS avoid resource limits on very long generations. Use ``None`` or ``<= 0`` for a
+    single ``lax.scan`` over all ``max_new_tokens - 1`` steps (legacy behavior).
 
     Returns ``[B, L + max_new_tokens]``. Trimming at EOS is left to callers (e.g. the infer script).
     """
@@ -100,11 +106,22 @@ def generate(
         return (rng_i, st_n, nt, pos_b + 1), nt
 
     rng, rng_loop = jax.random.split(rng)
-    _, rest = jax.lax.scan(
-        step,
-        (rng_loop, state, first, pos_vec),
-        None,
-        length=max_new_tokens - 1,
-    )
+    carry = (rng_loop, state, first, pos_vec)
+    total_steps = max_new_tokens - 1
+    chunk = decode_scan_chunk_size
+    use_chunks = chunk is not None and chunk > 0 and total_steps > chunk
+
+    if not use_chunks:
+        _, rest = jax.lax.scan(step, carry, None, length=total_steps)
+    else:
+        chunks: list[Array] = []
+        remaining = total_steps
+        while remaining > 0:
+            n = min(chunk, remaining)
+            carry, chunk_out = jax.lax.scan(step, carry, None, length=n)
+            chunks.append(chunk_out)
+            remaining -= n
+        rest = jnp.concatenate(chunks, axis=0)
+
     rest = jnp.swapaxes(rest, 0, 1)[..., 0]
     return jnp.concatenate([prompt_tokens, first, rest], axis=1)
