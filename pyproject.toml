@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kappa"
+version = "0.0.1"
+description = "Functional JAX building blocks for Gemma 3, Qwen 3 and Gpt-OSS inference and training (experimental)."
+readme ="AGENTS.md"
+requires-python = ">=3.11"
+dependencies = [
+  "jax",
+  "orbax-checkpoint",
+]
+
+[project.optional-dependencies]
+inference = [
+  "sentencepiece>=0.1.99",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kappa*"]

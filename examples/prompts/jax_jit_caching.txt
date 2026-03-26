@@ -1,0 +1,54 @@
+
+## JIT and caching
+
+With the compilation overhead of the first JIT call, understanding how and when {func}jax.jit caches previous compilations is key to using it effectively.
+
+Suppose we define f = jax.jit(g). When we first invoke f, it will get compiled, and the resulting XLA code will get cached. Subsequent calls of f will reuse the cached code.
+This is how jax.jit makes up for the up-front cost of compilation.
+
+If we specify static_argnums, then the cached code will be used only for the same values of arguments labelled as static. If any of them change, recompilation occurs.
+If there are many values, then your program might spend more time compiling than it would have executing ops one-by-one.
+
+Avoid calling {func}jax.jit on temporary functions defined inside loops or other Python scopes.
+For most cases, JAX will be able to use the compiled, cached function in subsequent calls to {func}jax.jit.
+However, because the cache relies on the hash of the function, it becomes problematic when equivalent functions are redefined.
+This will cause unnecessary compilation each time in the loop:
+
+{code-cell}
+from functools import partial
+
+def unjitted_loop_body(prev_i):
+  return prev_i + 1
+
+def g_inner_jitted_partial(x, n):
+  i = 0
+  while i < n:
+    # Don't do this! each time the partial returns
+    # a function with different hash
+    i = jax.jit(partial(unjitted_loop_body))(i)
+  return x + i
+
+def g_inner_jitted_lambda(x, n):
+  i = 0
+  while i < n:
+    # Don't do this!, lambda will also return
+    # a function with a different hash
+    i = jax.jit(lambda x: unjitted_loop_body(x))(i)
+  return x + i
+
+def g_inner_jitted_normal(x, n):
+  i = 0
+  while i < n:
+    # this is OK, since JAX can find the
+    # cached, compiled function
+    i = jax.jit(unjitted_loop_body)(i)
+  return x + i
+
+print("jit called in a loop with partials:")
+%timeit g_inner_jitted_partial(10, 20).block_until_ready()
+
+print("jit called in a loop with lambdas:")
+%timeit g_inner_jitted_lambda(10, 20).block_until_ready()
+
+print("jit called in a loop with caching:")
+%timeit g_inner_jitted_normal(10, 20).block_until_ready()
