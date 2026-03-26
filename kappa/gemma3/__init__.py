@@ -20,6 +20,12 @@ from kappa.gemma3.block import (
 )
 from kappa.gemma3.ffn import feed_forward
 from kappa.gemma3.generate import generate
+from kappa.gemma3.jit_inference import (
+    jit_forward_decode_step,
+    jit_forward_prefill,
+    jit_forward_prefill_chunk,
+    jit_generate,
+)
 from kappa.gemma3.kv_cache import (
     DenseKVState,
     advance_lengths,
@@ -105,6 +111,10 @@ __all__ = [
     "generate",
     "init_dense_inference_state",
     "init_dense_kv",
+    "jit_forward_decode_step",
+    "jit_forward_prefill",
+    "jit_forward_prefill_chunk",
+    "jit_generate",
     "kv_from_prefill",
     "load_gemma3_dense_unsharded",
     "local_sliding_extended",

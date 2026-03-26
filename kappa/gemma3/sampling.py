@@ -20,10 +20,10 @@ def top_k_mask(logits: Array, top_k: int) -> Array:
         return jnp.ones_like(logits, dtype=bool)
     inner = logits.shape[-1]
     k = min(top_k, inner)
-    indices = jnp.argsort(logits, axis=-1, descending=True)
-    rank_ok = jnp.arange(inner) < k
-    rank_ok = jnp.broadcast_to(rank_ok, indices.shape)
-    _, mask = jax.lax.sort_key_val(indices, rank_ok, dimension=-1)
+    _, indices = jax.lax.top_k(logits, k)
+    mask = jnp.zeros(logits.shape, dtype=bool)
+    for i in range(k):
+        mask = mask | jax.nn.one_hot(indices[..., i], inner).astype(jnp.bool_)
     return mask
 
 

@@ -49,6 +49,26 @@ def dense_gqa_attention(
     return jnp.einsum("bhqk,bkhd->bqhd", weights, v)
 
 
+def _decode_attention_full(
+    q: Array,
+    k: Array,
+    v: Array,
+    *,
+    kv_lengths: Array,
+    attn_logits_soft_cap: float | None,
+    window_size: int | Array,
+) -> Array:
+    _, lk, _, _ = k.shape
+    j = jnp.arange(lk, dtype=jnp.int32)[None, :]
+    len_exp = kv_lengths[:, None]
+    valid = j < len_exp
+    q_pos = len_exp - 1
+    valid = valid & (j >= (q_pos - jnp.asarray(window_size, dtype=jnp.int32)))
+    mask_add = jnp.where(valid, 0.0, neg_inf(jnp.float32))
+    mask_add = mask_add[:, None, None, :]
+    return dense_gqa_attention(q, k, v, mask_add, attn_logits_soft_cap=attn_logits_soft_cap)
+
+
 def decode_attention_dense(
     q: Array,
     k_cache: Array,
@@ -63,6 +83,10 @@ def decode_attention_dense(
     Masks keys past ``kv_lengths[b]-1`` (assumes current token's K/V already written at index length-1).
     ``window_size`` restricts attention to the most recent ``window_size`` keys.  Pass ``0`` or
     ``max_cache_len`` to disable (global layers).  Accepts traced JAX values for ``jax.lax.scan``.
+
+    Always uses masked logits over the **full** cache length (``O(S)`` matmul).  A previous
+    windowed path used ``vmap(dynamic_slice)``, which lowers to batched ``stablehlo.gather`` and can
+    exhaust Metal allocator limits on long ``lax.scan`` decode runs (MPS).
     """
     n_q = q.shape[-2]
     n_kv = k_cache.shape[-2]
@@ -70,18 +94,8 @@ def decode_attention_dense(
         raise ValueError("GQA repeat ratio invalid")
     k = repeat_kv_heads(k_cache, num_query_heads=n_q, num_kv_heads=n_kv)
     v = repeat_kv_heads(v_cache, num_query_heads=n_q, num_kv_heads=n_kv)
-    b, lq, _, d = q.shape
-    _, lk, _, _ = k.shape
-    j = jnp.arange(lk, dtype=jnp.int32)[None, :]
-    len_exp = kv_lengths[:, None]
-    valid = j < len_exp
-    # Always apply window mask; window_size=0 or >=lk means all keys are in window (no-op).
-    q_pos = len_exp - 1
-    valid = valid & (j >= (q_pos - jnp.asarray(window_size, dtype=jnp.int32)))
-    mask_add = jnp.where(valid, 0.0, neg_inf(jnp.float32))
-    mask_add = mask_add[:, None, None, :]
-    return dense_gqa_attention(
-        q, k, v, mask_add, attn_logits_soft_cap=attn_logits_soft_cap
+    return _decode_attention_full(
+        q, k, v, kv_lengths=kv_lengths, attn_logits_soft_cap=attn_logits_soft_cap, window_size=window_size
     )
 
 

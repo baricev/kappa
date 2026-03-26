@@ -30,8 +30,64 @@ def init_dense_kv(
     head_dim: int,
     dtype: jnp.dtype,
 ) -> DenseKVState:
-    z = jnp.zeros((batch, max_len, num_kv_heads, head_dim), dtype=dtype)
-    return DenseKVState(k=z, v=z, lengths=jnp.zeros((batch,), dtype=jnp.int32))
+    shape = (batch, max_len, num_kv_heads, head_dim)
+    return DenseKVState(
+        k=jnp.zeros(shape, dtype=dtype),
+        v=jnp.zeros(shape, dtype=dtype),
+        lengths=jnp.zeros((batch,), dtype=jnp.int32),
+    )
+
+
+def _write_kv_decode_token(
+    state: DenseKVState,
+    k_new: Array,
+    v_new: Array,
+    *,
+    start: Array,
+) -> DenseKVState:
+    """Single-token write: ``k_new``, ``v_new`` are ``[B, 1, n_kv, D]``.
+
+    One-hot mask + ``jnp.where`` only (no ``vmap(dynamic_update_slice)``, no batched ``gather``).
+    The gather-based path materializes ``[B, S, …]`` from a tiny ``k_new`` each step and can exhaust
+    MPS allocator limits during long ``lax.scan`` decode.
+    """
+    _, s, _, _ = state.k.shape
+    pos = start.astype(jnp.int32)
+    s_idx = jnp.arange(s, dtype=jnp.int32)[None, :]
+    mask = s_idx == pos[:, None]
+    mask_kv = mask[:, :, None, None]
+    kn = k_new[:, 0, :, :]
+    vn = v_new[:, 0, :, :]
+    k_out = jnp.where(mask_kv, kn[:, None, :, :], state.k)
+    v_out = jnp.where(mask_kv, vn[:, None, :, :], state.v)
+    return DenseKVState(k=k_out, v=v_out, lengths=state.lengths)
+
+
+def _write_kv_range_loop(
+    state: DenseKVState,
+    k_new: Array,
+    v_new: Array,
+    *,
+    start: Array,
+    lc: int,
+) -> DenseKVState:
+    """Multi-token write without scatter or batched gather: one masked merge per offset."""
+    _, s, _, _ = state.k.shape
+
+    def body(t: Array, carry: tuple[Array, Array]) -> tuple[Array, Array]:
+        k_acc, v_acc = carry
+        pos = start.astype(jnp.int32) + t
+        s_idx = jnp.arange(s, dtype=jnp.int32)[None, :]
+        mask = s_idx == pos[:, None]
+        mask_kv = mask[:, :, None, None]
+        kn = k_new[:, t, :, :]
+        vn = v_new[:, t, :, :]
+        k_acc = jnp.where(mask_kv, kn[:, None, :, :], k_acc).astype(k_acc.dtype)
+        v_acc = jnp.where(mask_kv, vn[:, None, :, :], v_acc).astype(v_acc.dtype)
+        return k_acc, v_acc
+
+    k_out, v_out = jax.lax.fori_loop(0, lc, body, (state.k, state.v))
+    return DenseKVState(k=k_out, v=v_out, lengths=state.lengths)
 
 
 def write_kv_range(
@@ -41,17 +97,25 @@ def write_kv_range(
     *,
     start: Array,
 ) -> DenseKVState:
-    """Write ``k_new``, ``v_new`` ``[B, seq_len, n_kv, D]`` at ``start[b]`` along the length axis."""
+    """Write ``k_new``, ``v_new`` ``[B, seq_len, n_kv, D]`` at ``start[b]`` along the length axis.
 
-    def _one(k_row: Array, v_row: Array, kn: Array, vn: Array, st: Array) -> tuple[Array, Array]:
-        st_i = st.astype(jnp.int32)
-        return (
-            jax.lax.dynamic_update_slice_in_dim(k_row, kn, st_i, axis=0),
-            jax.lax.dynamic_update_slice_in_dim(v_row, vn, st_i, axis=0),
-        )
+    Avoids ``vmap(dynamic_update_slice)`` (batched scatter issues on MPS; see ``MPS_PORTING_NOTES.md``)
+    and avoids batched ``gather`` from small ``k_new`` onto full length ``S`` on the **decode**
+    path (``seq_len == 1``), which can hit Metal allocator limits during long generation.
 
-    k, v = jax.vmap(_one)(state.k, state.v, k_new, v_new, start)
-    return DenseKVState(k=k, v=v, lengths=state.lengths)
+    - ``seq_len == 1``: one-hot ``jnp.where`` (decode hot path).
+    - ``seq_len > 1``: ``fori_loop`` of single-position writes (prefill chunks; no gather).
+    """
+    _, lc, nk, hd = k_new.shape
+    if v_new.shape != k_new.shape:
+        raise ValueError("k_new and v_new must have the same shape")
+    _, s, nk_s, hd_s = state.k.shape
+    if (nk, hd) != (nk_s, hd_s):
+        raise ValueError("KV head dims must match state")
+
+    if lc == 1:
+        return _write_kv_decode_token(state, k_new, v_new, start=start)
+    return _write_kv_range_loop(state, k_new, v_new, start=start, lc=lc)
 
 
 def advance_lengths(state: DenseKVState, delta: Array) -> DenseKVState:

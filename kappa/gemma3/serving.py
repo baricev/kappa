@@ -98,7 +98,10 @@ def decode_step(
     ``active_slot_ids``: reserved for subset decode; ``None`` decodes all batch rows. Non-``None``
     subset routing is not implemented yet — pass ``None`` and slice inputs on the host if needed.
     """
-    del active_slot_ids
+    if active_slot_ids is not None:
+        raise NotImplementedError(
+            "decode_step with active_slot_ids is not implemented; pass None or slice on the host."
+        )
     x = embed_tokens(prev_tokens, params.input_embedding_table)
     pos = seq_lens[:, None].astype(jnp.int32)
     return forward_decode_step(

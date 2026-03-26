@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 
@@ -73,13 +74,12 @@ def prefill_square_chunk_dense(
     *,
     attn_logits_soft_cap: float | None = None,
 ) -> Array:
-    """Square causal chunk: ``q,k,v`` each ``[B, L, n_*, D]`` (same ``L``)."""
-    l = q.shape[1]
-    m = causal_square(l)
-    mask_add = bool_to_additive(m)[None, None, :, :]
-    return prefill_attention_dense(
-        q, k, v, mask_add, attn_logits_soft_cap=attn_logits_soft_cap
-    )
+    """Square causal chunk: ``q,k,v`` each ``[B, L, n_*, D]`` (same ``L``).
+
+    Uses :func:`~kappa.gemma3.splash_prefill.prefill_chunk_autoselect` (Splash on TPU when
+    eligible; dense otherwise).
+    """
+    return prefill_chunk_autoselect(q, k, v, attn_logits_soft_cap=attn_logits_soft_cap)
 
 
 def prefill_chunk_with_prefix_dense(
@@ -108,8 +108,25 @@ def prefill_chunk_with_prefix_dense(
         segment_k=segment_k,
         token_valid=token_valid,
     )
-    return prefill_attention_dense(
+    dense = lambda: prefill_attention_dense(
         q, k, v, mask_add, attn_logits_soft_cap=attn_logits_soft_cap
+    )
+    if segment_q is not None or segment_k is not None:
+        return dense()
+    if lq != lk:
+        return dense()
+    if attn_logits_soft_cap is not None:
+        return dense()
+    tv_ok = jnp.asarray(True) if token_valid is None else jnp.all(token_valid)
+    splash_pred = (
+        jnp.all(prefix_len == 0)
+        & tv_ok
+        & jnp.asarray(attn_type == int(AttentionType.GLOBAL), dtype=jnp.bool_)
+    )
+    return jax.lax.cond(
+        splash_pred,
+        lambda: prefill_chunk_autoselect(q, k, v, attn_logits_soft_cap=None),
+        dense,
     )
 
 
