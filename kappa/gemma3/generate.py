@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import time
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import Array
@@ -22,6 +25,11 @@ from kappa.gemma3.weights import Gemma3DenseParams
 _DEFAULT_STOP_TOKEN_IDS: tuple[int, ...] = (GEMMA3_EOS, GEMMA3_END_OF_TURN)
 
 
+def _block(*xs: Any) -> None:
+    for x in xs:
+        jax.block_until_ready(x)
+
+
 def generate(
     rng: Array,
     prompt_tokens: Array,
@@ -37,7 +45,8 @@ def generate(
     pad_token_id: int = 0,
     decode_scan_chunk_size: int | None = 128,
     stop_token_ids: tuple[int, ...] | None = None,
-) -> Array:
+    return_timings: bool = False,
+) -> Array | tuple[Array, dict[str, float]]:
     """Generate up to ``max_new_tokens`` new tokens after ``prompt_tokens`` (``[B, L]``).
 
     Uses Gemma-style **non-padding** masks (``token != pad_token_id``), RoPE positions from
@@ -60,10 +69,16 @@ def generate(
 
     Returns ``[B, L + T]`` with ``T <= max_new_tokens`` when early stop triggers. Callers may still
     trim for display.
+
+    If ``return_timings`` is True, returns ``(output, timings)`` where ``timings`` has (seconds,
+    host-side, after ``block_until_ready``): ``prefill_s``, ``ttft_s`` (time to first **new** token),
+    ``decode_s`` (autoregressive steps only; 0 if only one new token), ``total_s``.
     """
+    t_all0 = time.perf_counter()
     valid = (prompt_tokens != pad_token_id).astype(jnp.bool_)
     pos0 = positions_from_mask(valid)
 
+    t_pf0 = time.perf_counter()
     _, logits, state = forward_prefill(
         prompt_tokens,
         pos0,
@@ -74,6 +89,8 @@ def generate(
         token_valid_mask=valid,
         max_len=max_cache_len,
     )
+    _block(logits, state)
+    prefill_s = time.perf_counter() - t_pf0
 
     logit = gather_last_valid_logits(logits, valid)
     rng, rng_a = jax.random.split(rng)
@@ -88,9 +105,26 @@ def generate(
             top_p=top_p,
         )
         first = tok[:, None].astype(jnp.int32)
+    _block(first)
+    ttft_s = time.perf_counter() - t_all0
+    t_dec0 = time.perf_counter()
+
+    def _finish(out: Array, *, decode_s: float | None = None) -> Array | tuple[Array, dict[str, float]]:
+        _block(out)
+        ds = time.perf_counter() - t_dec0 if decode_s is None else decode_s
+        total_s = time.perf_counter() - t_all0
+        if not return_timings:
+            return out
+        return out, {
+            "prefill_s": prefill_s,
+            "ttft_s": ttft_s,
+            "decode_s": ds,
+            "total_s": total_s,
+        }
 
     if max_new_tokens <= 1:
-        return jnp.concatenate([prompt_tokens, first], axis=1)
+        out = jnp.concatenate([prompt_tokens, first], axis=1)
+        return _finish(out, decode_s=0.0)
 
     pos_vec = jnp.sum(valid, axis=1).astype(jnp.int32)
     total_steps = max_new_tokens - 1
@@ -99,7 +133,8 @@ def generate(
     stop_set = frozenset(stops)
 
     if use_early_stop and int(first[0, 0]) in stop_set:
-        return jnp.concatenate([prompt_tokens, first], axis=1)
+        out = jnp.concatenate([prompt_tokens, first], axis=1)
+        return _finish(out, decode_s=0.0)
 
     def step(carry, _):
         rng_i, st, last_tok, pos_b = carry
@@ -164,7 +199,8 @@ def generate(
         _f = jax.lax.while_loop(cond, body, carry_w0)
         _rng, _st, _lt, _pb, n_written, rest_buf, _go = _f
         rest = rest_buf[:n_written, :].T
-        return jnp.concatenate([prompt_tokens, first, rest], axis=1)
+        out = jnp.concatenate([prompt_tokens, first, rest], axis=1)
+        return _finish(out)
 
     if not use_chunks:
         _, rest = jax.lax.scan(step, carry, None, length=total_steps)
@@ -179,4 +215,5 @@ def generate(
         rest = jnp.concatenate(chunks, axis=0)
 
     rest = jnp.swapaxes(rest, 0, 1)[..., 0]
-    return jnp.concatenate([prompt_tokens, first, rest], axis=1)
+    out = jnp.concatenate([prompt_tokens, first, rest], axis=1)
+    return _finish(out)

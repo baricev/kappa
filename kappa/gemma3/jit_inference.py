@@ -25,6 +25,7 @@ jit_generate = jax.jit(
         "pad_token_id",
         "decode_scan_chunk_size",
         "stop_token_ids",
+        "return_timings",
     ),
 )
 

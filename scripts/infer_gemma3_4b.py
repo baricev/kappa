@@ -81,6 +81,11 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not stop at EOS / <end_of_turn> (run up to --max-new-tokens every time).",
     )
+    p.add_argument(
+        "--timings",
+        action="store_true",
+        help="Print prefill / TTFT / decode / total seconds and tok/s (after JAX work completes).",
+    )
     return p.parse_args()
 
 
@@ -171,7 +176,7 @@ def main() -> None:
     rng = jax.random.key(args.seed)
     decode_chunk = None if args.decode_chunk_size <= 0 else args.decode_chunk_size
     stop_ids: tuple[int, ...] | None = () if args.no_early_stop else None
-    out = generate(
+    gen = generate(
         rng,
         prompt,
         params=params,
@@ -182,7 +187,26 @@ def main() -> None:
         temperature=0.0,
         decode_scan_chunk_size=decode_chunk,
         stop_token_ids=stop_ids,
+        return_timings=args.timings,
     )
+    if args.timings:
+        out, timings = gen
+        n_new = int(out.shape[1]) - plen
+        ttot = timings["total_s"]
+        tdec = timings["decode_s"]
+        print(
+            f"timings: prefill={timings['prefill_s']:.3f}s  "
+            f"ttft={timings['ttft_s']:.3f}s  "
+            f"decode={tdec:.3f}s  "
+            f"total={ttot:.3f}s",
+            flush=True,
+        )
+        if ttot > 0 and n_new > 0:
+            print(f"throughput: {n_new / ttot:.2f} new tok/s (total time)", flush=True)
+        if tdec > 0 and n_new > 1:
+            print(f"throughput: {(n_new - 1) / tdec:.2f} new tok/s (decode only, excl. first token)", flush=True)
+    else:
+        out = gen
     out_ids = out[0].tolist()
     text = _decode_generated(sp, out_ids, plen, eos_id=GEMMA3_EOS)
     print("\n--- generated (continuation; stops at EOS) ---\n")
