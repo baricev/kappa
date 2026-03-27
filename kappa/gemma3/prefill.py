@@ -16,7 +16,7 @@ from kappa.gemma3.masks import (
     segment_rect_mask,
     token_pair_valid_mask,
 )
-from kappa.gemma3.splash_prefill import prefill_chunk_autoselect
+from kappa.gemma3.splash_prefill import prefill_chunk_autoselect, splash_square_q_len_ok
 
 
 def mask_prefill_chunk_with_prefix(
@@ -122,6 +122,7 @@ def prefill_chunk_with_prefix_dense(
         jnp.all(prefix_len == 0)
         & tv_ok
         & jnp.asarray(attn_type == int(AttentionType.GLOBAL), dtype=jnp.bool_)
+        & jnp.asarray(splash_square_q_len_ok(lq), dtype=jnp.bool_)
     )
     return jax.lax.cond(
         splash_pred,

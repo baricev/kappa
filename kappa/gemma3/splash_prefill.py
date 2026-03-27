@@ -18,6 +18,25 @@ _DEFAULT_SPLASH_MIN_LEN = 128
 _logger = logging.getLogger(__name__)
 
 
+def _splash_q_block_size() -> int:
+    """Default Splash block size; ``make_splash_mha`` requires ``q_seq_len`` divisible by this."""
+    try:
+        from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as sak
+
+        bs = sak.BlockSizes.get_default()
+        return int(getattr(bs, "q_block_size", 128))
+    except Exception:
+        return 128
+
+
+def splash_square_q_len_ok(seq_len: int) -> bool:
+    """Whether square Splash prefill is valid at this length (TPU kernel divisor rule)."""
+    if seq_len <= 0:
+        return False
+    qbs = _splash_q_block_size()
+    return seq_len % qbs == 0
+
+
 def _platform() -> str:
     try:
         return jax.devices()[0].platform
@@ -45,10 +64,16 @@ def prefill_square_chunk_splash(
         raise ValueError(
             "prefill_square_chunk_splash does not support attn_logits_soft_cap; use dense attention."
         )
+    b, l, num_q, d = q.shape
+    qbs = _splash_q_block_size()
+    if l % qbs != 0:
+        raise ValueError(
+            f"Splash square prefill requires q_seq_len ({l}) divisible by q_block_size ({qbs}); "
+            "use prefill_chunk_autoselect (dense fallback) or pad the sequence."
+        )
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel as sak
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as sam
 
-    b, l, num_q, d = q.shape
     num_kv = k.shape[2]
     k = repeat_kv_heads(k, num_query_heads=num_q, num_kv_heads=num_kv)
     v = repeat_kv_heads(v, num_query_heads=num_q, num_kv_heads=num_kv)
@@ -86,6 +111,9 @@ def prefill_chunk_autoselect(
 ) -> Array:
     """Square chunk: dense below ``splash_min_len`` (default 128); else Splash on TPU if available.
 
+    Splash also requires ``q_seq_len`` divisible by the kernel ``q_block_size`` (typically 128); odd
+    lengths use dense without attempting Splash.
+
     Set ``KAPPA_SPLASH_PREFILL=0`` to always use dense.
 
     When ``attn_logits_soft_cap`` is not ``None``, always uses dense attention (Splash kernel has no
@@ -97,7 +125,12 @@ def prefill_chunk_autoselect(
         force_dense = True
     min_len = splash_min_len if splash_min_len is not None else _DEFAULT_SPLASH_MIN_LEN
     l = q.shape[1]
-    if force_dense or l < min_len or _platform() != "tpu":
+    if (
+        force_dense
+        or l < min_len
+        or _platform() != "tpu"
+        or not splash_square_q_len_ok(l)
+    ):
         m = causal_square(l)
         mask_add = bool_to_additive(m)[None, None, :, :]
         return prefill_attention_dense(q, k, v, mask_add, attn_logits_soft_cap=attn_logits_soft_cap)
