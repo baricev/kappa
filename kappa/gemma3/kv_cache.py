@@ -9,6 +9,17 @@ import jax.numpy as jnp
 from jax import Array
 
 
+def _kv_use_where_merge() -> bool:
+    """Apple MPS: avoid indexed scatter / ``vmap(dynamic_update_slice)`` (see ``MPS_PORTING_NOTES.md``).
+
+    TPU/CUDA/CPU: use ``.at[...].set`` so writes are O(token·heads) instead of O(cache_len).
+    """
+    try:
+        return jax.devices()[0].platform == "mps"
+    except Exception:
+        return False
+
+
 class DenseKVState(NamedTuple):
     """Pre-allocated K/V buffers and per-row valid lengths.
 
@@ -90,6 +101,49 @@ def _write_kv_range_loop(
     return DenseKVState(k=k_out, v=v_out, lengths=state.lengths)
 
 
+def _write_kv_decode_token_scatter_at(
+    state: DenseKVState,
+    k_new: Array,
+    v_new: Array,
+    *,
+    start: Array,
+) -> DenseKVState:
+    """Single-token write via advanced-indexing scatter (efficient on TPU/GPU/CPU)."""
+    b = state.k.shape[0]
+    b_idx = jnp.arange(b, dtype=jnp.int32)
+    pos = start.astype(jnp.int32)
+    kn = k_new[:, 0, :, :]
+    vn = v_new[:, 0, :, :]
+    k_out = state.k.at[b_idx, pos, :, :].set(kn)
+    v_out = state.v.at[b_idx, pos, :, :].set(vn)
+    return DenseKVState(k=k_out, v=v_out, lengths=state.lengths)
+
+
+def _write_kv_range_scatter_at(
+    state: DenseKVState,
+    k_new: Array,
+    v_new: Array,
+    *,
+    start: Array,
+    lc: int,
+) -> DenseKVState:
+    """Chunked prefill: one scatter per token offset (O(lc) small writes, not O(lc·S))."""
+    b = state.k.shape[0]
+    b_idx = jnp.arange(b, dtype=jnp.int32)
+
+    def body(t: Array, carry: tuple[Array, Array]) -> tuple[Array, Array]:
+        k_acc, v_acc = carry
+        pos = start.astype(jnp.int32) + t
+        kn = k_new[:, t, :, :]
+        vn = v_new[:, t, :, :]
+        k_acc = k_acc.at[b_idx, pos, :, :].set(kn)
+        v_acc = v_acc.at[b_idx, pos, :, :].set(vn)
+        return k_acc, v_acc
+
+    k_out, v_out = jax.lax.fori_loop(0, lc, body, (state.k, state.v))
+    return DenseKVState(k=k_out, v=v_out, lengths=state.lengths)
+
+
 def write_kv_range(
     state: DenseKVState,
     k_new: Array,
@@ -99,12 +153,10 @@ def write_kv_range(
 ) -> DenseKVState:
     """Write ``k_new``, ``v_new`` ``[B, seq_len, n_kv, D]`` at ``start[b]`` along the length axis.
 
-    Avoids ``vmap(dynamic_update_slice)`` (batched scatter issues on MPS; see ``MPS_PORTING_NOTES.md``)
-    and avoids batched ``gather`` from small ``k_new`` onto full length ``S`` on the **decode**
-    path (``seq_len == 1``), which can hit Metal allocator limits during long generation.
-
-    - ``seq_len == 1``: one-hot ``jnp.where`` (decode hot path).
-    - ``seq_len > 1``: ``fori_loop`` of single-position writes (prefill chunks; no gather).
+    - **MPS**: one-hot ``jnp.where`` / masked merge only (avoids ``vmap(dynamic_update_slice)`` /
+      batched scatter issues; see ``MPS_PORTING_NOTES.md``).
+    - **TPU / CUDA / CPU**: ``x.at[batch, pos].set(slice)`` scatter — O(seq_len) work per write,
+      not O(seq_len · cache_len).
     """
     _, lc, nk, hd = k_new.shape
     if v_new.shape != k_new.shape:
@@ -113,9 +165,14 @@ def write_kv_range(
     if (nk, hd) != (nk_s, hd_s):
         raise ValueError("KV head dims must match state")
 
+    use_where = _kv_use_where_merge()
     if lc == 1:
-        return _write_kv_decode_token(state, k_new, v_new, start=start)
-    return _write_kv_range_loop(state, k_new, v_new, start=start, lc=lc)
+        if use_where:
+            return _write_kv_decode_token(state, k_new, v_new, start=start)
+        return _write_kv_decode_token_scatter_at(state, k_new, v_new, start=start)
+    if use_where:
+        return _write_kv_range_loop(state, k_new, v_new, start=start, lc=lc)
+    return _write_kv_range_scatter_at(state, k_new, v_new, start=start, lc=lc)
 
 
 def advance_lengths(state: DenseKVState, delta: Array) -> DenseKVState:

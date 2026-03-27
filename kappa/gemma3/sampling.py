@@ -21,10 +21,9 @@ def top_k_mask(logits: Array, top_k: int) -> Array:
     inner = logits.shape[-1]
     k = min(top_k, inner)
     _, indices = jax.lax.top_k(logits, k)
-    mask = jnp.zeros(logits.shape, dtype=bool)
-    for i in range(k):
-        mask = mask | jax.nn.one_hot(indices[..., i], inner).astype(jnp.bool_)
-    return mask
+    # (... , k, V) then reduce over k — avoids a Python loop of one_hot + OR for large k.
+    oh = jax.nn.one_hot(indices, inner).astype(jnp.bool_)
+    return jnp.any(oh, axis=-2)
 
 
 def top_p_mask(logits: Array, top_p: float) -> Array:

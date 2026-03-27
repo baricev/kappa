@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 
@@ -106,25 +107,31 @@ def apply_rope_for_layer(
 ) -> Array:
     """Apply RoPE using local or global frequencies depending on ``attn_type``.
 
-    ``attn_type`` may be a Python ``AttentionType`` (unrolled loop) **or** a traced
-    JAX int (``jax.lax.scan`` over layers).  When ``rope_cache`` is provided the
-    dispatch is a single ``dynamic_index_in_dim`` — no Python branching.
+    ``attn_type`` may be a Python ``AttentionType`` or a traced JAX scalar (e.g. layer
+    ``scan``).  With ``rope_cache``, dispatch uses stacked sin/cos tables; without it,
+    ``lax.cond`` selects local vs global on-the-fly RoPE.
     """
     if rope_cache is None:
-        # On-the-fly path — requires Python-known attn_type (no traced values).
-        if attn_type == AttentionType.GLOBAL:
+        # On-the-fly path: ``lax.cond`` so ``attn_type`` may be a traced scalar (e.g. layer scan).
+        pred = jnp.asarray(attn_type == int(AttentionType.GLOBAL), dtype=jnp.bool_)
+
+        def _global(_: None) -> Array:
             return apply_rope(
                 x,
                 positions,
                 base_frequency=float(cfg.global_base_frequency),
                 scale_factor=cfg.global_scale_factor,
             )
-        return apply_rope(
-            x,
-            positions,
-            base_frequency=float(cfg.local_base_frequency),
-            scale_factor=cfg.local_scale_factor,
-        )
+
+        def _local(_: None) -> Array:
+            return apply_rope(
+                x,
+                positions,
+                base_frequency=float(cfg.local_base_frequency),
+                scale_factor=cfg.local_scale_factor,
+            )
+
+        return jax.lax.cond(pred, _global, _local, operand=None)
     sin_stack, cos_stack = rope_cache
     # Works for both Python int/enum and traced JAX int.
     idx = jnp.asarray(attn_type == int(AttentionType.GLOBAL), dtype=jnp.int32)

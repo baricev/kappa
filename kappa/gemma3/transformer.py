@@ -51,8 +51,8 @@ def init_dense_inference_state(
 def embed_tokens(tokens: Array, embed_table: Array) -> Array:
     """Token ids ``[B, L]`` -> embeddings ``[B, L, E]`` (scaled)."""
     t = tokens.astype(jnp.int32)
-    # Orbax often returns NumPy arrays; must use JAX arrays so traced indices work in ``scan``/``jit``.
-    et = jnp.asarray(embed_table)
+    # Avoid ``jnp.asarray`` on device arrays (no-op but can confuse constant folding); convert host once.
+    et = embed_table if isinstance(embed_table, Array) else jnp.asarray(embed_table)
     x = et[t]
     e = jnp.asarray(et.shape[-1], dtype=jnp.float32)
     return x * jnp.sqrt(e).astype(x.dtype)
@@ -60,7 +60,7 @@ def embed_tokens(tokens: Array, embed_table: Array) -> Array:
 
 def logits_from_hidden(x: Array, embed_table: Array) -> Array:
     """Tied weights: ``[B, L, E]`` -> ``[B, L, V]`` logits (float32)."""
-    et = jnp.asarray(embed_table)
+    et = embed_table if isinstance(embed_table, Array) else jnp.asarray(embed_table)
     return jnp.einsum("btd,vd->btv", x.astype(jnp.float32), et.astype(jnp.float32))
 
 
