@@ -198,7 +198,8 @@ def main() -> None:
             f"timings: prefill={timings['prefill_s']:.3f}s  "
             f"ttft={timings['ttft_s']:.3f}s  "
             f"decode={tdec:.3f}s  "
-            f"total={ttot:.3f}s",
+            f"total={ttot:.3f}s  "
+            f"new_tokens={n_new}",
             flush=True,
         )
         if ttot > 0 and n_new > 0:
