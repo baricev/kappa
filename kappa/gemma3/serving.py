@@ -80,6 +80,7 @@ def prefill_chunk(
         state=kv_cache,
         start_pos=start_pos,
         true_chunk_lens=tc,
+        last_logits_only=True,
     )
 
 

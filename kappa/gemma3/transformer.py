@@ -59,9 +59,24 @@ def embed_tokens(tokens: Array, embed_table: Array) -> Array:
 
 
 def logits_from_hidden(x: Array, embed_table: Array) -> Array:
-    """Tied weights: ``[B, L, E]`` -> ``[B, L, V]`` logits (float32)."""
+    """Tied weights: ``[B, L, E]`` -> ``[B, L, V]`` logits (same dtype as activations/embeddings)."""
     et = embed_table if isinstance(embed_table, Array) else jnp.asarray(embed_table)
-    return jnp.einsum("btd,vd->btv", x.astype(jnp.float32), et.astype(jnp.float32))
+    dt = jnp.promote_types(x.dtype, et.dtype)
+    return jnp.einsum("btd,vd->btv", x.astype(dt), et.astype(dt))
+
+
+def logits_from_hidden_last_positions(x: Array, embed_table: Array, last_idx: Array) -> Array:
+    """Tied logits at one position per row: ``x`` ``[B, L, E]``, ``last_idx`` ``[B]`` int32 -> ``[B, V]``.
+
+    Memory-efficient vs :func:`logits_from_hidden` when only the last valid positions matter
+    (e.g. generation after prefill).
+    """
+    et = embed_table if isinstance(embed_table, Array) else jnp.asarray(embed_table)
+    b = x.shape[0]
+    rows = jnp.arange(b, dtype=jnp.int32)
+    h = x[rows, last_idx, :]
+    dt = jnp.promote_types(h.dtype, et.dtype)
+    return jnp.einsum("be,ve->bv", h.astype(dt), et.astype(dt))
 
 
 def _maybe_final_logit_softcap(logits: Array, cap: float | None) -> Array:
@@ -92,11 +107,15 @@ def forward_prefill(
     segment_ids: Array | None = None,
     token_valid_mask: Array | None = None,
     max_len: int | None = None,
+    last_logits_only: bool = False,
 ) -> tuple[Array, Array, DenseInferenceState]:
     """Run full prefill: ``tokens`` ``[B, L]``, ``positions`` ``[B, L]``.
 
     Returns ``(hidden, logits, inference_state)`` with KV caches seeded for decode.
     ``max_len`` must be >= ``L`` (defaults to ``L``).
+
+    ``last_logits_only``: if True, ``logits`` is ``[B, V]`` at the last valid token per row only
+    (avoids materializing ``[B, L, V]``, which is prohibitive for long prompts + large vocab).
     """
     ml = max_len if max_len is not None else int(tokens.shape[1])
     x = embed_tokens(tokens, params.input_embedding_table)
@@ -121,7 +140,11 @@ def forward_prefill(
         )
         kvs.append(kv_from_prefill(k, v, max_len=ml, lengths=kv_lens))
     x = rms_norm(x, params.final_norm_scale)
-    logits = logits_from_hidden(x, params.input_embedding_table)
+    if last_logits_only:
+        last_idx = jnp.maximum(jnp.sum(valid, axis=1).astype(jnp.int32) - 1, 0)
+        logits = logits_from_hidden_last_positions(x, params.input_embedding_table, last_idx)
+    else:
+        logits = logits_from_hidden(x, params.input_embedding_table)
     logits = _maybe_final_logit_softcap(logits, cfg.final_logit_softcap)
     return x, logits, DenseInferenceState(tuple(kvs))
 
@@ -135,6 +158,7 @@ def forward_prefill_chunk(
     state: DenseInferenceState,
     start_pos: int,
     true_chunk_lens: Array,
+    last_logits_only: bool = False,
 ) -> tuple[Array, Array, DenseInferenceState]:
     """Chunked prefill with **dense-prefix** attention (MaxText-style).
 
@@ -148,6 +172,9 @@ def forward_prefill_chunk(
 
     Caller must ensure cache rows already hold a valid prefix when ``start_pos > 0`` (lengths and
     ``[:, :start_pos, ...]`` populated).
+
+    ``last_logits_only``: if True, ``logits`` is ``[B, V]`` at the last valid token of this chunk
+    per row (avoids materializing ``[B, Lc, V]``).
     """
     b, lc = tokens_chunk.shape[0], int(tokens_chunk.shape[1])
     valid = jnp.arange(lc, dtype=jnp.int32)[None, :] < true_chunk_lens[:, None]
@@ -184,7 +211,11 @@ def forward_prefill_chunk(
         st = set_lengths(st, new_lens)
         new_kvs.append(st)
     x = rms_norm(x, params.final_norm_scale)
-    logits = logits_from_hidden(x, params.input_embedding_table)
+    if last_logits_only:
+        last_in_chunk = jnp.maximum(true_chunk_lens.astype(jnp.int32) - 1, 0)
+        logits = logits_from_hidden_last_positions(x, params.input_embedding_table, last_in_chunk)
+    else:
+        logits = logits_from_hidden(x, params.input_embedding_table)
     logits = _maybe_final_logit_softcap(logits, cfg.final_logit_softcap)
     return x, logits, DenseInferenceState(tuple(new_kvs))
 

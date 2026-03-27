@@ -68,6 +68,7 @@ from kappa.gemma3.transformer import (
     gather_last_valid_logits,
     init_dense_inference_state,
     logits_from_hidden,
+    logits_from_hidden_last_positions,
 )
 from kappa.gemma3.weights import (
     Gemma3DenseParams,
@@ -119,6 +120,7 @@ __all__ = [
     "load_gemma3_dense_unsharded",
     "local_sliding_extended",
     "logits_from_hidden",
+    "logits_from_hidden_last_positions",
     "mask_prefill_chunk_with_prefix",
     "param_tree_leaves_shapes",
     "params_from_flat",

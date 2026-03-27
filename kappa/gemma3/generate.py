@@ -17,7 +17,6 @@ from kappa.gemma3.transformer import (
     embed_tokens,
     forward_decode_step,
     forward_prefill,
-    gather_last_valid_logits,
 )
 from kappa.gemma3.special_tokens import GEMMA3_END_OF_TURN, GEMMA3_EOS
 from kappa.gemma3.weights import Gemma3DenseParams
@@ -88,11 +87,12 @@ def generate(
         segment_ids=None,
         token_valid_mask=valid,
         max_len=max_cache_len,
+        last_logits_only=True,
     )
     _block(logits, state)
     prefill_s = time.perf_counter() - t_pf0
 
-    logit = gather_last_valid_logits(logits, valid)
+    logit = logits
     rng, rng_a = jax.random.split(rng)
     if temperature == 0.0:
         first = jnp.argmax(logit, axis=-1).astype(jnp.int32)[:, None]
