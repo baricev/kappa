@@ -7,6 +7,7 @@ Example::
 
     source mps-python-3.13/bin/activate
     python scripts/infer_gemma3_4b.py --prompt "The capital of France is"
+    python scripts/infer_gemma3_4b.py --prompt-file ./prompt.txt
 """
 
 from __future__ import annotations
@@ -38,7 +39,19 @@ def _parse_args() -> argparse.Namespace:
         default=_REPO_ROOT,
         help="Repository root (for default tokenizer path)",
     )
-    p.add_argument("--prompt", type=str, default="The meaning of life is")
+    p.add_argument(
+        "--prompt",
+        type=str,
+        default="The meaning of life is",
+        help="Prompt string (ignored if --prompt-file is set)",
+    )
+    p.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Read prompt text from this file (UTF-8); overrides --prompt",
+    )
     p.add_argument("--max-new-tokens", type=int, default=48)
     p.add_argument(
         "--max-cache-len",
@@ -138,6 +151,14 @@ def main() -> None:
         print(f"Tokenizer not found: {tok_path}", file=sys.stderr)
         raise SystemExit(1)
 
+    if args.prompt_file is not None:
+        if not args.prompt_file.is_file():
+            print(f"Prompt file not found: {args.prompt_file}", file=sys.stderr)
+            raise SystemExit(1)
+        prompt_text = args.prompt_file.read_text(encoding="utf-8")
+    else:
+        prompt_text = args.prompt
+
     import jax
     import jax.numpy as jnp
 
@@ -158,7 +179,7 @@ def main() -> None:
     sp = _load_tokenizer(tok_path)
     ids = _encode_prompt(
         sp,
-        args.prompt,
+        prompt_text,
         use_bos=not args.no_bos,
         bos_id=GEMMA3_BOS,
         chat=args.chat,
@@ -172,7 +193,10 @@ def main() -> None:
         )
         raise SystemExit(1)
 
-    print(f"Prompt ({plen} tokens): {args.prompt!r}", flush=True)
+    if args.prompt_file is not None:
+        print(f"Prompt from {args.prompt_file} ({plen} tokens)", flush=True)
+    else:
+        print(f"Prompt ({plen} tokens): {prompt_text!r}", flush=True)
     rng = jax.random.key(args.seed)
     decode_chunk = None if args.decode_chunk_size <= 0 else args.decode_chunk_size
     stop_ids: tuple[int, ...] | None = () if args.no_early_stop else None

@@ -1,0 +1,2 @@
+Explain how JAX tracing, jitting, and recompilation interact for long-sequence inference workloads.
+Explain the tradeoffs between dense monotonic KV caches and paged KV caches on TPU serving systems.
