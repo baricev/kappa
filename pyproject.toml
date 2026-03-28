@@ -16,6 +16,8 @@ dependencies = [
 [project.optional-dependencies]
 inference = [
   "sentencepiece>=0.1.99",
+  "huggingface_hub",
+  "tokenizers>=0.15.0",
 ]
 
 [tool.setuptools.packages.find]
