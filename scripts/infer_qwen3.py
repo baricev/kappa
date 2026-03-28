@@ -19,6 +19,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -100,6 +101,13 @@ def _parse_args() -> argparse.Namespace:
         "--chat",
         action="store_true",
         help="Wrap prompt in Qwen3 chat turns (im_start/im_end).",
+    )
+    p.add_argument(
+        "--moe-impl",
+        type=str,
+        default="gather_einsum",
+        choices=("gather_einsum", "fixed_capacity", "ragged_jax", "ragged_tokamax"),
+        help="MoE expert path for MoE presets (dense models ignore this).",
     )
     return p.parse_args()
 
@@ -183,10 +191,14 @@ def main() -> None:
 
     print(f"Loading checkpoint from {ckpt} (this can take a while)...", flush=True)
     cfg, params = load_qwen3_unsharded(ckpt, preset=args.model, dtype=dtype)  # type: ignore[arg-type]
+    if cfg.use_moe:
+        cfg = dataclasses.replace(cfg, moe_impl=args.moe_impl)  # type: ignore[arg-type]
     print(
         f"Config: {cfg.num_layers} layers, model_dim={cfg.model_dim}, moe={cfg.use_moe}",
         flush=True,
     )
+    if cfg.use_moe:
+        print(f"  moe_impl={cfg.moe_impl}", flush=True)
 
     max_len = args.max_cache_len
     rope_cache = build_qwen3_rope_cache(cfg, max_seq_len=max_len)

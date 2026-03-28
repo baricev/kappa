@@ -49,5 +49,11 @@ Reference trees are read-only sources for ideas and tests:
     https://github.com/google-deepmind/simply
     https://github.com/vllm-project/tpu-inference.git
 
+## Qwen 3 (MoE paths, tokenizer, parity)
+
+- **Checkpoints / tokenizer**: Orbax layout via `kappa.qwen3.load`; HF flat conversion in `kappa.checkpoint.qwen_hf_convert`. Use a HF tokenizer directory with `tokenizer.json` (`uv pip install -e '.[inference]'`). **`--model` / preset must match** the checkpoint (embed width, layer count, dense vs MoE).
+- **MoE execution** (`Qwen3Config`): `moe_impl` is one of `gather_einsum` (default), `fixed_capacity` (capacity-limited dispatch; can drop routes), `ragged_jax` (`jax.lax.ragged_dot`), `ragged_tokamax` (uses **Tokamax** when installed; otherwise same as `ragged_jax`). Install Tokamax from source, e.g. `uv pip install git+https://github.com/openxla/tokamax.git`. See `moe_capacity_factor`, `moe_ragged_decode_token_threshold` in `kappa/qwen3/architecture.py`. For small token counts (decode), ragged modes automatically use `gather_einsum` when `total_tokens <= moe_ragged_decode_token_threshold`.
+- **Parity**: We do **not** treat Hugging Face logits/hidden states as a required reference; prefer internal checks (e.g. `scripts/verify_qwen3_moe_impls.py`) and `Integrating_MaxText_MoE_Strategies.md` for the MoE roadmap.
+
 ## Important:
 - ignore the `ignore/` directory and all of its contents. Do NOT search or read it.

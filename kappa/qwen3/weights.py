@@ -4,9 +4,29 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import jax.numpy as jnp
 from jax import Array
 
 from kappa.checkpoint.qwen_flat import FlatParams
+
+
+def normalize_lm_head_for_logits(embed: Array, lm_head: Array | None) -> Array | None:
+    """``logits_from_hidden`` uses ``einsum(..., vd)`` with ``v=vocab``, ``d=model_dim``.
+
+    HuggingFace ``lm_head.weight`` is ``[vocab, model_dim]``. Simply ``output_layer/w`` is often
+    transposed to ``[model_dim, vocab]``.
+    """
+    if lm_head is None:
+        return None
+    v_sz, d_sz = embed.shape[0], embed.shape[1]
+    if lm_head.shape[0] == v_sz and lm_head.shape[1] == d_sz:
+        return lm_head
+    if lm_head.shape[0] == d_sz and lm_head.shape[1] == v_sz:
+        return jnp.transpose(lm_head)
+    raise ValueError(
+        f"lm_head shape {lm_head.shape} does not match embed table {tuple(embed.shape)} "
+        "as [vocab, dim] or [dim, vocab]."
+    )
 
 
 class AttnParams(NamedTuple):
@@ -105,4 +125,5 @@ def params_from_flat(
             )
             blocks.append(Qwen3DenseBlockParams(pre0, pre1, attn, ffn))
 
+    lm_head = normalize_lm_head_for_logits(embed, lm_head)
     return Qwen3Params(embed=embed, final_norm=final_norm, blocks=tuple(blocks), lm_head=lm_head)

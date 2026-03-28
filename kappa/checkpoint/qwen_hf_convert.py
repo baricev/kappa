@@ -18,6 +18,7 @@ from kappa.qwen3.weights import (
     Qwen3DenseBlockParams,
     Qwen3MoEBlockParams,
     Qwen3Params,
+    normalize_lm_head_for_logits,
 )
 
 
@@ -106,17 +107,15 @@ def _hf_flat_to_qwen3_dense_params(flat: dict[str, Array], cfg: Qwen3Config, hd:
     embed = flat["model.embed_tokens.weight"]
     final_norm = flat["model.norm.weight"]
 
-    if "lm_head.weight" in flat:
-        lm = jnp.transpose(flat["lm_head.weight"])
-    else:
-        lm = None
+    lm_raw = flat["lm_head.weight"] if "lm_head.weight" in flat else None
 
     if cfg.use_tied_embedding:
         lm_head: Array | None = None
     else:
-        if lm is None:
+        if lm_raw is None:
             raise ValueError("untied model requires lm_head.weight")
-        lm_head = lm
+        # HF: [vocab, model_dim] — matches ``einsum(..., vd)``; no transpose.
+        lm_head = normalize_lm_head_for_logits(embed, lm_raw)
 
     blocks: list[Qwen3DenseBlockParams] = []
     for i in range(cfg.num_layers):
@@ -184,7 +183,7 @@ def _hf_flat_to_qwen3_moe_params(flat: dict[str, Array], cfg: Qwen3Config) -> Qw
     else:
         if "lm_head.weight" not in flat:
             raise ValueError("untied MoE model requires lm_head.weight")
-        lm_head = jnp.transpose(flat["lm_head.weight"])
+        lm_head = normalize_lm_head_for_logits(embed, flat["lm_head.weight"])
 
     blocks: list[Qwen3MoEBlockParams] = []
     for i in range(cfg.num_layers):

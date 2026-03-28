@@ -11,6 +11,8 @@ ModelPreset = Literal[
     "qwen3-30b-a3b",
 ]
 
+MoEImpl = Literal["gather_einsum", "fixed_capacity", "ragged_jax", "ragged_tokamax"]
+
 
 @dataclass(frozen=True, slots=True)
 class Qwen3Config:
@@ -35,6 +37,10 @@ class Qwen3Config:
     # Generation defaults (HF Qwen3 chat template)
     pad_token_id: int
     eos_token_id: int
+    # MoE execution (ignored when use_moe=False); see AGENTS.md
+    moe_impl: MoEImpl = "gather_einsum"
+    moe_capacity_factor: float = 1.25
+    moe_ragged_decode_token_threshold: int = 64
 
 
 def qwen3_config_for_preset(preset: ModelPreset) -> Qwen3Config:

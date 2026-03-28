@@ -74,8 +74,7 @@ def block_forward_prefill(
             params.ffn.gate_proj,
             params.ffn.up_proj,
             params.ffn.down_proj,
-            num_experts=cfg.num_experts,
-            num_experts_per_tok=cfg.num_experts_per_tok,
+            cfg=cfg,
         )
     else:
         out = swiglu_ffn(h2, params.ffn.gate_proj, params.ffn.up_proj, params.ffn.down_proj)
@@ -120,8 +119,7 @@ def block_forward_decode(
             params.ffn.gate_proj,
             params.ffn.up_proj,
             params.ffn.down_proj,
-            num_experts=cfg.num_experts,
-            num_experts_per_tok=cfg.num_experts_per_tok,
+            cfg=cfg,
         )
     else:
         out = swiglu_ffn(h2, params.ffn.gate_proj, params.ffn.up_proj, params.ffn.down_proj)
