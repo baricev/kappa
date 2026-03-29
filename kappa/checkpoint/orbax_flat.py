@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,20 +16,19 @@ _logger = logging.getLogger(__name__)
 FlatParams = dict[str, jax.Array]
 
 
-def _restore_pytree_onto_local_devices(ckptr: ocp.PyTreeCheckpointer, path: Path) -> Any:
-    """Restore arrays onto ``jax.local_devices()[0]``, ignoring saved shardings.
+def _restore_with_step_tree_metadata(ckptr: ocp.PyTreeCheckpointer, path: Path) -> Any:
+    """Restore using :meth:`Checkpointer.metadata` + explicit local shardings.
 
-    Checkpoints saved on another backend (e.g. MPS) embed device ids in sharding
-    metadata; default Orbax restore then fails on TPU/GPU with "Device MPS:0 was
-    not found". We rebuild :class:`ArrayRestoreArgs` with a local
-    :class:`~jax.sharding.SingleDeviceSharding`.
+    Requires a readable PyTree metadata file (Orbax ``_METADATA`` under the step
+    directory). Optional step-level ``_CHECKPOINT_METADATA`` may be absent; that
+    only triggers a harmless absl warning.
     """
     from orbax.checkpoint._src.metadata.tree import TreeMetadata, build_default_tree_metadata
 
-    step = ckptr.metadata(str(path))
+    step = ckptr.metadata(os.fspath(path))
     item_meta = step.item_metadata
     if item_meta is None:
-        raise ValueError("checkpoint StepMetadata.item_metadata is None")
+        raise ValueError("StepMetadata.item_metadata is None (PyTree _METADATA missing or unreadable)")
     if not isinstance(item_meta, TreeMetadata):
         raise TypeError(
             f"expected TreeMetadata for single-item PyTree checkpoint, got {type(item_meta)}"
@@ -43,8 +43,33 @@ def _restore_pytree_onto_local_devices(ckptr: ocp.PyTreeCheckpointer, path: Path
     )
     restore_args = ocp.checkpoint_utils.construct_restore_args(item_meta, sharding_tm)
     return ckptr.restore(
-        str(path),
+        os.fspath(path),
         args=ocp.args.PyTreeRestore(item=item_meta, restore_args=restore_args),
+    )
+
+
+def _restore_with_inferred_structure(ckptr: ocp.PyTreeCheckpointer, path: Path) -> Any:
+    """Restore when PyTree ``_METADATA`` is missing but Orbax can infer layout (OCDBT + aggregate).
+
+    Uses the same :meth:`PyTreeCheckpointHandler._get_internal_metadata` path as
+    Orbax's legacy restore, then supplies :class:`~jax.sharding.SingleDeviceSharding`
+    for every array so checkpoints saved on another backend (e.g. MPS) load on
+    TPU/GPU.
+    """
+    from etils import epath
+
+    handler = ckptr._handler  # noqa: SLF001
+    directory = epath.Path(os.fspath(path))
+    structure, _use_zarr3 = handler._get_internal_metadata(directory)  # noqa: SLF001
+    devices = jax.local_devices()
+    if not devices:
+        raise RuntimeError("jax.local_devices() is empty; cannot restore")
+    sharding = jax.sharding.SingleDeviceSharding(devices[0])
+    sharding_tree = jax.tree.map(lambda _: sharding, structure)
+    restore_args = ocp.checkpoint_utils.construct_restore_args(structure, sharding_tree)
+    return ckptr.restore(
+        os.fspath(path),
+        args=ocp.args.PyTreeRestore(item=None, restore_args=restore_args),
     )
 
 
@@ -63,24 +88,43 @@ def flatten_pytree_to_dict(tree: Any) -> FlatParams:
 def load_orbax_pytree(path: str | Path) -> Any:
     """Restore the checkpoint root as a PyTree (structure depends on how it was saved).
 
-    Uses explicit local-device shardings when checkpoint metadata is available so
-    restores work across backends (e.g. MPS-saved weights on TPU).
+    Orbax may log that ``_CHECKPOINT_METADATA`` is missing; that file is optional
+    step-level metadata and does not by itself break restore.
+
+    We first rebuild :class:`ArrayRestoreArgs` with
+    :class:`~jax.sharding.SingleDeviceSharding` for the current backend so
+    checkpoints saved elsewhere (e.g. MPS) work on TPU/GPU. If the PyTree
+    ``_METADATA`` file is absent, we infer structure from the checkpoint (same as
+    Orbax legacy) and still override shardings.
     """
     path = Path(path)
     _logger.info("Restoring Orbax checkpoint from %s", path)
     ckptr = ocp.PyTreeCheckpointer()
-    try:
-        return _restore_pytree_onto_local_devices(ckptr, path)
-    except (
+    _step_meta_errors = (
         FileNotFoundError,
         ImportError,
         ValueError,
         TypeError,
         AttributeError,
         RuntimeError,
-    ) as e:
-        _logger.info("Orbax default restore path (%s)", e)
-        return ckptr.restore(str(path))
+    )
+    try:
+        return _restore_with_step_tree_metadata(ckptr, path)
+    except _step_meta_errors as e:
+        _logger.info(
+            "Orbax restore: step/PyTree metadata path skipped (%s: %s); trying inferred structure",
+            type(e).__name__,
+            e,
+        )
+    try:
+        return _restore_with_inferred_structure(ckptr, path)
+    except Exception as e:
+        _logger.info(
+            "Orbax restore: inferred-structure path skipped (%s: %s); using default restore",
+            type(e).__name__,
+            e,
+        )
+    return ckptr.restore(os.fspath(path))
 
 
 def load_gemma3_flat_params(
