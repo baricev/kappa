@@ -15,6 +15,39 @@ _logger = logging.getLogger(__name__)
 FlatParams = dict[str, jax.Array]
 
 
+def _restore_pytree_onto_local_devices(ckptr: ocp.PyTreeCheckpointer, path: Path) -> Any:
+    """Restore arrays onto ``jax.local_devices()[0]``, ignoring saved shardings.
+
+    Checkpoints saved on another backend (e.g. MPS) embed device ids in sharding
+    metadata; default Orbax restore then fails on TPU/GPU with "Device MPS:0 was
+    not found". We rebuild :class:`ArrayRestoreArgs` with a local
+    :class:`~jax.sharding.SingleDeviceSharding`.
+    """
+    from orbax.checkpoint._src.metadata.tree import TreeMetadata, build_default_tree_metadata
+
+    step = ckptr.metadata(str(path))
+    item_meta = step.item_metadata
+    if item_meta is None:
+        raise ValueError("checkpoint StepMetadata.item_metadata is None")
+    if not isinstance(item_meta, TreeMetadata):
+        raise TypeError(
+            f"expected TreeMetadata for single-item PyTree checkpoint, got {type(item_meta)}"
+        )
+    devices = jax.local_devices()
+    if not devices:
+        raise RuntimeError("jax.local_devices() is empty; cannot restore")
+    sharding = jax.sharding.SingleDeviceSharding(devices[0])
+    sharding_tm = build_default_tree_metadata(
+        jax.tree.map(lambda _: sharding, item_meta.tree),
+        use_zarr3=getattr(item_meta, "use_zarr3", False),
+    )
+    restore_args = ocp.checkpoint_utils.construct_restore_args(item_meta, sharding_tm)
+    return ckptr.restore(
+        str(path),
+        args=ocp.args.PyTreeRestore(item=item_meta, restore_args=restore_args),
+    )
+
+
 def _path_key_to_str(path: tuple[Any, ...]) -> str:
     parts: list[str] = []
     for k in path:
@@ -28,10 +61,26 @@ def flatten_pytree_to_dict(tree: Any) -> FlatParams:
 
 
 def load_orbax_pytree(path: str | Path) -> Any:
-    """Restore the checkpoint root as a PyTree (structure depends on how it was saved)."""
+    """Restore the checkpoint root as a PyTree (structure depends on how it was saved).
+
+    Uses explicit local-device shardings when checkpoint metadata is available so
+    restores work across backends (e.g. MPS-saved weights on TPU).
+    """
     path = Path(path)
     _logger.info("Restoring Orbax checkpoint from %s", path)
-    return ocp.PyTreeCheckpointer().restore(str(path))
+    ckptr = ocp.PyTreeCheckpointer()
+    try:
+        return _restore_pytree_onto_local_devices(ckptr, path)
+    except (
+        FileNotFoundError,
+        ImportError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        RuntimeError,
+    ) as e:
+        _logger.info("Orbax default restore path (%s)", e)
+        return ckptr.restore(str(path))
 
 
 def load_gemma3_flat_params(
