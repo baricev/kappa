@@ -7,7 +7,9 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import Array
 
-from kappa.checkpoint.qwen_flat import FlatParams
+# Local alias avoids importing ``kappa.checkpoint`` (package ``__init__`` pulls ``qwen_hf_convert``
+# → ``weights``) when this module is loaded from ``sharding`` or other early imports.
+FlatParams = dict[str, Array]
 
 
 def normalize_lm_head_for_logits(embed: Array, lm_head: Array | None) -> Array | None:

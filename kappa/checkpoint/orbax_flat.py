@@ -43,13 +43,10 @@ def _pytree_checkpointer(*, restore_concurrent_gb: int | None) -> ocp.Checkpoint
     )
 
 
-def _restore_with_step_tree_metadata(ckptr: ocp.Checkpointer, path: Path) -> Any:
-    """Restore using :meth:`Checkpointer.metadata` + explicit local shardings.
-
-    Requires a readable PyTree metadata file (Orbax ``_METADATA`` under the step
-    directory). Optional step-level ``_CHECKPOINT_METADATA`` may be absent; that
-    only triggers a harmless absl warning.
-    """
+def _restore_with_step_tree_metadata(
+    ckptr: ocp.Checkpointer, path: Path, *, as_numpy_leaves: bool
+) -> Any:
+    """Restore via step metadata; JAX single-device sharding or numpy host leaves."""
     from orbax.checkpoint._src.metadata.tree import TreeMetadata, build_default_tree_metadata
 
     step = ckptr.metadata(os.fspath(path))
@@ -60,40 +57,47 @@ def _restore_with_step_tree_metadata(ckptr: ocp.Checkpointer, path: Path) -> Any
         raise TypeError(
             f"expected TreeMetadata for single-item PyTree checkpoint, got {type(item_meta)}"
         )
-    devices = jax.local_devices()
-    if not devices:
-        raise RuntimeError("jax.local_devices() is empty; cannot restore")
-    sharding = jax.sharding.SingleDeviceSharding(devices[0])
-    sharding_tm = build_default_tree_metadata(
-        jax.tree.map(lambda _: sharding, item_meta.tree),
-        use_zarr3=getattr(item_meta, "use_zarr3", False),
-    )
-    restore_args = ocp.checkpoint_utils.construct_restore_args(item_meta, sharding_tm)
+    if as_numpy_leaves:
+        noop_sharding = build_default_tree_metadata(
+            jax.tree.map(lambda _: None, item_meta.tree),
+            use_zarr3=getattr(item_meta, "use_zarr3", False),
+        )
+        restore_args = ocp.checkpoint_utils.construct_restore_args(item_meta, noop_sharding)
+    else:
+        devices = jax.local_devices()
+        if not devices:
+            raise RuntimeError("jax.local_devices() is empty; cannot restore")
+        sharding = jax.sharding.SingleDeviceSharding(devices[0])
+        sharding_tm = build_default_tree_metadata(
+            jax.tree.map(lambda _: sharding, item_meta.tree),
+            use_zarr3=getattr(item_meta, "use_zarr3", False),
+        )
+        restore_args = ocp.checkpoint_utils.construct_restore_args(item_meta, sharding_tm)
     return ckptr.restore(
         os.fspath(path),
         args=ocp.args.PyTreeRestore(item=item_meta, restore_args=restore_args),
     )
 
 
-def _restore_with_inferred_structure(ckptr: ocp.Checkpointer, path: Path) -> Any:
-    """Restore when PyTree ``_METADATA`` is missing but Orbax can infer layout (OCDBT + aggregate).
-
-    Uses the same :meth:`PyTreeCheckpointHandler._get_internal_metadata` path as
-    Orbax's legacy restore, then supplies :class:`~jax.sharding.SingleDeviceSharding`
-    for every array so checkpoints saved on another backend (e.g. MPS) load on
-    TPU/GPU.
-    """
+def _restore_with_inferred_structure(
+    ckptr: ocp.Checkpointer, path: Path, *, as_numpy_leaves: bool
+) -> Any:
+    """Restore when PyTree ``_METADATA`` is missing (OCDBT + aggregate)."""
     from etils import epath
 
     handler = ckptr._handler  # noqa: SLF001
     directory = epath.Path(os.fspath(path))
     structure, _use_zarr3 = handler._get_internal_metadata(directory)  # noqa: SLF001
-    devices = jax.local_devices()
-    if not devices:
-        raise RuntimeError("jax.local_devices() is empty; cannot restore")
-    sharding = jax.sharding.SingleDeviceSharding(devices[0])
-    sharding_tree = jax.tree.map(lambda _: sharding, structure)
-    restore_args = ocp.checkpoint_utils.construct_restore_args(structure, sharding_tree)
+    if as_numpy_leaves:
+        noop = jax.tree.map(lambda _: None, structure)
+        restore_args = ocp.checkpoint_utils.construct_restore_args(structure, noop)
+    else:
+        devices = jax.local_devices()
+        if not devices:
+            raise RuntimeError("jax.local_devices() is empty; cannot restore")
+        sharding = jax.sharding.SingleDeviceSharding(devices[0])
+        sharding_tree = jax.tree.map(lambda _: sharding, structure)
+        restore_args = ocp.checkpoint_utils.construct_restore_args(structure, sharding_tree)
     return ckptr.restore(
         os.fspath(path),
         args=ocp.args.PyTreeRestore(item=None, restore_args=restore_args),
@@ -116,17 +120,18 @@ def load_orbax_pytree(
     path: str | Path,
     *,
     restore_concurrent_gb: int | None = None,
+    restore_arrays_as_numpy: bool = False,
 ) -> Any:
     """Restore the checkpoint root as a PyTree (structure depends on how it was saved).
 
     Orbax may log that ``_CHECKPOINT_METADATA`` is missing; that file is optional
     step-level metadata and does not by itself break restore.
 
-    We first rebuild :class:`ArrayRestoreArgs` with
-    :class:`~jax.sharding.SingleDeviceSharding` for the current backend so
-    checkpoints saved elsewhere (e.g. MPS) work on TPU/GPU. If the PyTree
-    ``_METADATA`` file is absent, we infer structure from the checkpoint (same as
-    Orbax legacy) and still override shardings.
+    Unless ``restore_arrays_as_numpy`` is true, we rebuild :class:`ArrayRestoreArgs`
+    with :class:`~jax.sharding.SingleDeviceSharding` for ``local_devices()[0]`` so
+    checkpoints saved elsewhere (e.g. MPS) work on TPU/GPU. With
+    ``restore_arrays_as_numpy=True``, array leaves are read as ``numpy.ndarray`` on
+    host (for :func:`jax.device_put` with a :class:`~jax.sharding.Mesh`).
 
     Args:
         restore_concurrent_gb: Passed to :class:`ocp.PyTreeCheckpointHandler` as
@@ -137,9 +142,9 @@ def load_orbax_pytree(
             in-flight), which can overshoot **single-device** HBM for large models.
 
     Note:
-        Single-device restore still requires the **full** parameter set to fit one
-        chip's HBM. If the model is larger than one device, lowering concurrency only
-        helps peak/transient usage; you need a multi-device mesh and sharded load.
+        Single-device JAX restore requires the **full** parameter set to fit one
+        chip's HBM during Orbax read. Use ``restore_arrays_as_numpy=True`` before
+        sharding with a mesh (see ``kappa.qwen3.sharding``).
     """
     path = Path(path)
     _logger.info("Restoring Orbax checkpoint from %s", path)
@@ -147,6 +152,8 @@ def load_orbax_pytree(
     eff = _effective_restore_concurrent_gb(restore_concurrent_gb)
     if eff is not None:
         _logger.info("Orbax restore_concurrent_gb=%s (caps in-flight restore bytes)", eff)
+    if restore_arrays_as_numpy:
+        _logger.info("Orbax restore: array leaves as numpy (host memory)")
     _step_meta_errors = (
         FileNotFoundError,
         ImportError,
@@ -156,7 +163,7 @@ def load_orbax_pytree(
         RuntimeError,
     )
     try:
-        return _restore_with_step_tree_metadata(ckptr, path)
+        return _restore_with_step_tree_metadata(ckptr, path, as_numpy_leaves=restore_arrays_as_numpy)
     except _step_meta_errors as e:
         _logger.info(
             "Orbax restore: step/PyTree metadata path skipped (%s: %s); trying inferred structure",
@@ -164,7 +171,7 @@ def load_orbax_pytree(
             e,
         )
     try:
-        return _restore_with_inferred_structure(ckptr, path)
+        return _restore_with_inferred_structure(ckptr, path, as_numpy_leaves=restore_arrays_as_numpy)
     except Exception as e:
         _logger.info(
             "Orbax restore: inferred-structure path skipped (%s: %s); using default restore",
@@ -180,12 +187,17 @@ def load_gemma3_flat_params(
     dtype: jnp.dtype | None = None,
     drop_siglip: bool = True,
     restore_concurrent_gb: int | None = None,
+    restore_arrays_as_numpy: bool = False,
 ) -> FlatParams:
     """Load Gemma-3 dense checkpoint keys into a single flat dict (dot-separated paths).
 
     Adapted from the experimental ``gemma-jax`` loader; validate on your checkpoint revision.
     """
-    raw = load_orbax_pytree(path, restore_concurrent_gb=restore_concurrent_gb)
+    raw = load_orbax_pytree(
+        path,
+        restore_concurrent_gb=restore_concurrent_gb,
+        restore_arrays_as_numpy=restore_arrays_as_numpy,
+    )
     flat = flatten_pytree_to_dict(raw)
     if drop_siglip:
         flat = {k: v for k, v in flat.items() if not k.startswith("SigLiPFromPatches_0")}

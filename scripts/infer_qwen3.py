@@ -124,6 +124,14 @@ def _parse_args() -> argparse.Namespace:
         help="Orbax PyTree restore in-flight byte cap (GiB). Lower (e.g. 1--4) if TPU HBM OOM during "
         "checkpoint read. Env KAPPA_ORBAX_RESTORE_CONCURRENT_GB overrides when this flag is omitted.",
     )
+    p.add_argument(
+        "--mesh",
+        type=str,
+        default="none",
+        choices=("none", "auto"),
+        help="none: single-device load. auto: (1,N) device mesh, numpy Orbax restore, then "
+        "tensor-parallel PartitionSpec + jax.device_put (see kappa.qwen3.sharding).",
+    )
     return p.parse_args()
 
 
@@ -198,19 +206,36 @@ def main() -> None:
     import jax.numpy as jnp
 
     from kappa.qwen3.generate import generate
-    from kappa.qwen3.load import load_qwen3_unsharded
+    from kappa.qwen3.load import load_qwen3_for_mesh, load_qwen3_unsharded
     from kappa.qwen3.rope import build_qwen3_rope_cache
     from kappa.qwen3.special_tokens import QWEN3_EOS
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
 
     print(f"Loading checkpoint from {ckpt} (this can take a while)...", flush=True)
-    cfg, params = load_qwen3_unsharded(
-        ckpt,
-        preset=args.model,
-        dtype=dtype,
-        restore_concurrent_gb=args.orbax_restore_concurrent_gb,
-    )  # type: ignore[arg-type]
+    mesh = None
+    if args.mesh == "auto":
+        from kappa.qwen3.sharding import create_qwen3_device_mesh
+
+        mesh = create_qwen3_device_mesh()
+        cfg, params = load_qwen3_for_mesh(
+            ckpt,
+            mesh,
+            preset=args.model,  # type: ignore[arg-type]
+            dtype=dtype,
+            restore_concurrent_gb=args.orbax_restore_concurrent_gb,
+        )
+        print(
+            f"  sharded load: mesh shape {mesh.devices.shape} axes={mesh.axis_names}",
+            flush=True,
+        )
+    else:
+        cfg, params = load_qwen3_unsharded(
+            ckpt,
+            preset=args.model,
+            dtype=dtype,
+            restore_concurrent_gb=args.orbax_restore_concurrent_gb,
+        )  # type: ignore[arg-type]
     if cfg.use_moe:
         cfg = dataclasses.replace(cfg, moe_impl=args.moe_impl)  # type: ignore[arg-type]
     print(
@@ -245,9 +270,9 @@ def main() -> None:
     decode_chunk = None if args.decode_chunk_size <= 0 else args.decode_chunk_size
     stop_ids: tuple[int, ...] | None = () if args.no_early_stop else None
     pfc = args.prefill_chunk_size if args.prefill_chunk_size > 0 else None
-    gen = generate(
-        rng,
-        prompt,
+    _gen_kw = dict(
+        rng=rng,
+        prompt=prompt,
         params=params,
         cfg=cfg,
         rope_cache=rope_cache,
@@ -261,6 +286,11 @@ def main() -> None:
         pad_token_id=cfg.pad_token_id,
         eos_token_id=eos_id,
     )
+    if mesh is not None:
+        with mesh:
+            gen = generate(**_gen_kw)
+    else:
+        gen = generate(**_gen_kw)
     if args.timings:
         out, timings = gen
         n_new = int(out.shape[1]) - plen
