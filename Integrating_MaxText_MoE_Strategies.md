@@ -157,6 +157,39 @@ Overall, this is a highly robust architectural plan. It correctly identifies the
 
 ---
 
+## Quantization on TPU (MaxText-aligned, including MoE)
+
+In the **MaxText** reference stack on TPUs, the usual approach is **uniform low precision across the whole model**—attention projections, non-MoE FFN blocks, **and** MoE expert matmuls—rather than a standing policy of “INT8 (or INT8 weight-only) on dense layers only, experts stay BF16 until later.” Expert ragged paths were extended so quantization applies there too.
+
+### Backends (MaxText)
+
+- **Qwix** (recommended, relatively non-intrusive): quantized training/inference by intercepting `nn.Dense` / `dot_general`-style ops. Supports variants such as `"int8"`, `"fp8"`, `"fp8_full"`, etc. Configuration is often **global** (e.g. `use_qwix_quantization=true` plus a `quantization=...` flag), with optional **fine-grained `QtRule` regexes** (e.g. `decoder/.*layers.*`) to include or exclude module paths. Unless a rule excludes them, **the same rules apply to attention, MLP, and expert FFNs**.
+- **AQT** (fallback / legacy): supports `"int8"`, `"int8w"` (weights-only), `"int4w"`, and mixed-precision modes.
+
+### MoE expert matmuls (ragged kernels)
+
+Low precision is expected to flow into **expert** matmuls, not stop at the router:
+
+- **Megablox / `jax.lax.ragged_dot`**: supports **INT8, FP8, and BF16** on the forward path (multiple tile configurations).
+- **Tokamax `ragged_dot`**: optimized heavily for **FP8** (many tile configurations); broader dtype coverage evolves with the library—treat the Tokamax / MaxText release you pin as source of truth.
+
+### Aggressive FP8 recipe (production-oriented on modern TPUs)
+
+MaxText documents an **FP8-heavy** recipe (sometimes described in terms like **w8a8g8** semantics) aimed at large MoE on TPUs with strong FP8 support (e.g. Ironwood-class / v7x): **E4M3FN** for weights and activations with **static per-axis scaling** in a fixed nominal range, **E5M2** for gradients with dynamic scaling, rounding choices for reproducibility, and quantization applied across attention, MLP, **Megablox / grouped matmul paths**, and relevant **weight all-gathers**. **Splash** attention is often **excluded** from FP8 for VPU / quality reasons—that exclusion is an attention-kernel choice, not MoE-specific.
+
+### INT8 vs FP8 in practice
+
+- **INT8** (Qwix `int8` or AQT): conservative baseline; good for validating numerics and training stability.
+- **FP8** (`fp8` / `fp8_full`): more aggressive; on hardware with native FP8 MXUs it can materially improve compute density and MFU vs BF16; often preferred at scale for MoE once stability is confirmed.
+
+### Contrast with **kappa** (`jax-functional`) today
+
+This repo is **functional JAX** (einsum / `lax` MoE), **not** MaxText’s Flax/NNX + Qwix interception. There is **no** in-tree `use_qwix_quantization` switch. To mirror MaxText’s **full-model** INT8/FP8 story here you would either: adopt a **MaxText-class training/inference wrapper** around the same parameterization, or **reimplement** quantized contracts (scales, `dot_general` / packed weights, MoE ragged path dtype policy) on the existing `kappa/qwen3/*` forward. The **roadmap** items for Tokamax + EP still apply; quantization is an **additional** layer once those paths are stable.
+
+For authoritative flags, `QtRule` examples, and tile tuning, use **MaxText’s quantization guide** and **MoE configuration** docs in the pinned MaxText revision.
+
+---
+
 ## Kappa (`jax-functional`) roadmap: Qwen3 MoE
 
 This section maps the ideas above onto **this repo**. Phases **A–F** are kappa-specific naming; they align with **Phase 1 (fixed capacity)** and **Phase 2 (Tokamax)** in the preceding sections, plus decode, `shard_map`, and training stripping called out in *The Missing Pieces*.
@@ -210,6 +243,7 @@ This section maps the ideas above onto **this repo**. Phases **A–F** are kappa
 3. **Phase E** when scaling off single device: **`shard_map`**, expert-axis **PartitionSpec**, EP collectives (vendored patterns from MaxText, copied into `kappa`).
 4. **Phase F** when training MoE: load-balance loss, custom sort VJP, separate inference graph build.
 5. **Other Qwen inference gaps** (outside this MoE subsection): ~~chunked long prefill~~ (done: `forward_prefill_chunk` + `generate(..., prefill_chunk_size=)`); paged KV, etc.—see Gemma3 / separate notes.
+6. **Quantization (later)**: MaxText-style **full-model** INT8/FP8 (Qwix/AQT) including **expert** ragged matmuls—see **Quantization on TPU (MaxText-aligned, including MoE)** above; kappa has no Qwix interception today, so this is either a wrapper around MaxText-style modules or explicit quantized ops in `kappa/qwen3/*`.
 
 ### References (external)
 
