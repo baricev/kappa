@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 
 import jax
+import jax.lax as lax
 import jax.numpy as jnp
 
 from kappa.qwen3.architecture import Qwen3Config
@@ -79,6 +80,7 @@ def main() -> None:
             base,
             moe_impl="fixed_capacity",
             moe_capacity_factor=1_000.0,
+            moe_fixed_capacity_slots=2048,
             moe_ragged_decode_token_threshold=0,
         ),
     )
@@ -100,7 +102,38 @@ def main() -> None:
     err_j = jnp.max(jnp.abs(y_ragged - y_jit)).item()
     assert err_j < 1e-6, err_j
 
-    print("verify_qwen3_moe_impls: ok (legacy, ragged_jax, fixed_capacity high-cap, jit)")
+    # fixed_capacity under while_loop: buffer axis must stay static (dynamic c_dyn only in mask).
+    cap_cfg = dataclasses.replace(
+        base,
+        moe_impl="fixed_capacity",
+        moe_capacity_factor=1.25,
+        moe_fixed_capacity_slots=32,
+        moe_ragged_decode_token_threshold=0,
+    )
+    k6 = jax.random.split(key, 6)[-1]
+    acc0 = jax.random.normal(k6, (d,), dtype=jnp.float32)
+
+    @jax.jit
+    def loop_fixed_moe(acc0_):
+        def cond(c):
+            i, _ = c
+            return i < 4
+
+        def body(c):
+            i, acc = c
+            xi = jnp.broadcast_to(acc[None, None, :], (1, 1, d))
+            yi = moe_swiglu_ffn(xi, router_w, ffn_gate, ffn_up, ffn_down, cfg=cap_cfg)
+            return i + 1, acc + jnp.mean(yi, axis=(0, 1)) * 0.01
+
+        _, out = lax.while_loop(cond, body, (jnp.int32(0), acc0_))
+        return out
+
+    out_wl = loop_fixed_moe(acc0)
+    assert out_wl.shape == (d,)
+
+    print(
+        "verify_qwen3_moe_impls: ok (legacy, ragged_jax, fixed_capacity high-cap, jit, while_loop+fixed_cap)"
+    )
 
 
 if __name__ == "__main__":

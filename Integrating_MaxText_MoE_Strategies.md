@@ -209,7 +209,7 @@ This section maps the ideas above onto **this repo**. Phases **A–F** are kappa
 2. **Tests**: extend `verify_qwen3_moe_impls.py` to compare `ragged_tokamax` vs `ragged_jax` when Tokamax imports; optional `pytest` wiring.
 3. **Phase E** when scaling off single device: **`shard_map`**, expert-axis **PartitionSpec**, EP collectives (vendored patterns from MaxText, copied into `kappa`).
 4. **Phase F** when training MoE: load-balance loss, custom sort VJP, separate inference graph build.
-5. **Other Qwen inference gaps** (outside this MoE subsection): chunked long prefill, paged KV, etc.—see Gemma3 / separate notes.
+5. **Other Qwen inference gaps** (outside this MoE subsection): ~~chunked long prefill~~ (done: `forward_prefill_chunk` + `generate(..., prefill_chunk_size=)`); paged KV, etc.—see Gemma3 / separate notes.
 
 ### References (external)
 

@@ -7,11 +7,27 @@ and ``ragged_tokamax`` (optional ``tokamax`` package, falls back to JAX).
 
 from __future__ import annotations
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax import Array
 
 from kappa.qwen3.architecture import MoEImpl, Qwen3Config
+
+# Upper bound on B*T when deriving static fixed_capacity buffer width (slots per expert).
+_MOE_FIXED_CAP_MAX_BT = 8192
+
+
+def _fixed_capacity_buffer_slots(cfg: Qwen3Config) -> int:
+    """Compile-time per-expert buffer depth for fixed_capacity (not a JAX value)."""
+    if cfg.moe_fixed_capacity_slots is not None:
+        return max(1, int(cfg.moe_fixed_capacity_slots))
+    k, e = cfg.num_experts_per_tok, cfg.num_experts
+    if e <= 0 or k <= 0:
+        return 1
+    cap = cfg.moe_capacity_factor * _MOE_FIXED_CAP_MAX_BT * k / e
+    return max(1, int(math.ceil(cap)))
 
 
 def _route(
@@ -93,6 +109,7 @@ def _moe_fixed_capacity(
     num_experts: int,
     num_experts_per_tok: int,
     capacity_factor: float,
+    capacity_slots: int,
     b: int,
     t: int,
     d: int,
@@ -110,13 +127,14 @@ def _moe_fixed_capacity(
     sorted_w = w_flat[order]
     slot = _slot_within_expert(sorted_e)
     cap_f = jnp.asarray(capacity_factor, dtype=jnp.float32)
-    c = jnp.maximum(
+    c_dyn = jnp.maximum(
         jnp.int32(1),
         jnp.round(cap_f * jnp.float32(bt * num_experts_per_tok) / jnp.float32(num_experts)).astype(jnp.int32),
     )
-    valid = slot < c
+    c_buf = jnp.int32(capacity_slots)
+    valid = jnp.logical_and(slot < c_dyn, slot < c_buf)
     e = num_experts
-    buf = jnp.zeros((e, c, d), dtype=x_flat.dtype)
+    buf = jnp.zeros((e, capacity_slots, d), dtype=x_flat.dtype)
     safe_s = jnp.where(valid, slot, jnp.int32(0))
     buf = buf.at[sorted_e, safe_s].add(jnp.where(valid[:, None], sorted_x, jnp.zeros_like(sorted_x)))
     g = jnp.einsum("ecd,edi->eci", buf, ffn_gate)
@@ -223,6 +241,7 @@ def moe_swiglu_ffn(
     if impl == "fixed_capacity":
         if cfg.moe_capacity_factor <= 0:
             raise ValueError("fixed_capacity requires cfg.moe_capacity_factor > 0")
+        slots = _fixed_capacity_buffer_slots(cfg)
         return _moe_fixed_capacity(
             x_flat,
             idx,
@@ -233,6 +252,7 @@ def moe_swiglu_ffn(
             num_experts=num_experts,
             num_experts_per_tok=k,
             capacity_factor=cfg.moe_capacity_factor,
+            capacity_slots=slots,
             b=b,
             t=t,
             d=d,

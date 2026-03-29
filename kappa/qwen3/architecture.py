@@ -40,6 +40,10 @@ class Qwen3Config:
     # MoE execution (ignored when use_moe=False); see AGENTS.md
     moe_impl: MoEImpl = "gather_einsum"
     moe_capacity_factor: float = 1.25
+    # Static per-expert slot count for fixed_capacity buffers (compile-time axis). If None,
+    # derived from moe_capacity_factor and a conservative max token count; must be >= dynamic
+    # capacity for all forwards (see ffn_moe). Override for long unchunked prefill or huge factors.
+    moe_fixed_capacity_slots: int | None = None
     moe_ragged_decode_token_threshold: int = 64
 
 

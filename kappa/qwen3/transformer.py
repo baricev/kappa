@@ -7,9 +7,14 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import Array
 
-from kappa.gemma3.kv_cache import DenseKVState, init_dense_kv
+from kappa.gemma3.kv_cache import DenseKVState, init_dense_kv, set_lengths, write_kv_range
 from kappa.qwen3.architecture import Qwen3Config
-from kappa.qwen3.block import block_forward_decode, block_forward_prefill, kv_from_prefill
+from kappa.qwen3.block import (
+    block_forward_decode,
+    block_forward_prefill,
+    block_forward_prefill_chunk,
+    kv_from_prefill,
+)
 from kappa.qwen3.rope import RopeCache
 from kappa.qwen3.norms import rms_norm
 from kappa.qwen3.weights import Qwen3Params
@@ -111,6 +116,70 @@ def forward_prefill(
             else logits_from_hidden(x, w_head)
         )
     return x, logits, Qwen3InferenceState(tuple(kvs))
+
+
+def forward_prefill_chunk(
+    tokens_chunk: Array,
+    *,
+    params: Qwen3Params,
+    cfg: Qwen3Config,
+    rope_cache: RopeCache | None,
+    state: Qwen3InferenceState,
+    start_pos: int,
+    true_chunk_lens: Array,
+    last_logits_only: bool = False,
+) -> tuple[Array, Array, Qwen3InferenceState]:
+    """Chunked prefill with dense-prefix attention (same contract as Gemma3 ``forward_prefill_chunk``).
+
+    ``start_pos`` must be **uniform** across the batch (length-bucketed compilation when jitted).
+    ``true_chunk_lens`` is int32 ``[B]`` with ``1 <= true_chunk_lens[b] <= Lc`` for active rows.
+    """
+    b, lc = tokens_chunk.shape[0], int(tokens_chunk.shape[1])
+    valid = jnp.arange(lc, dtype=jnp.int32)[None, :] < true_chunk_lens[:, None]
+    positions = jnp.broadcast_to(
+        jnp.arange(start_pos, start_pos + lc, dtype=jnp.int32),
+        (b, lc),
+    )
+    x = embed_tokens(tokens_chunk, params.embed)
+    new_kvs: list[DenseKVState] = []
+    start_vec = jnp.full((b,), start_pos, dtype=jnp.int32)
+    new_lens = start_pos + true_chunk_lens.astype(jnp.int32)
+    for i, block_p in enumerate(params.blocks):
+        kv_i = state.kv[i]
+        prefix_k = None
+        prefix_v = None
+        if start_pos > 0:
+            prefix_k = kv_i.k[:, :start_pos, :, :]
+            prefix_v = kv_i.v[:, :start_pos, :, :]
+        x, k_ch, v_ch = block_forward_prefill_chunk(
+            x,
+            positions,
+            params=block_p,
+            cfg=cfg,
+            rope_cache=rope_cache,
+            prefix_k=prefix_k,
+            prefix_v=prefix_v,
+            start_pos=start_pos,
+            token_valid_chunk=valid,
+        )
+        k_ch = k_ch * valid[..., None, None]
+        v_ch = v_ch * valid[..., None, None]
+        st = write_kv_range(kv_i, k_ch, v_ch, start=start_vec)
+        st = set_lengths(st, new_lens)
+        new_kvs.append(st)
+    x = rms_norm(x, params.final_norm)
+    w_head = params.embed if cfg.use_tied_embedding else params.lm_head
+    assert w_head is not None
+    if last_logits_only:
+        last_in_chunk = jnp.maximum(true_chunk_lens.astype(jnp.int32) - 1, 0)
+        logits = logits_from_hidden_last_positions(x, w_head, last_in_chunk)
+    else:
+        logits = (
+            logits_from_hidden_tied(x, w_head)
+            if cfg.use_tied_embedding
+            else logits_from_hidden(x, w_head)
+        )
+    return x, logits, Qwen3InferenceState(tuple(new_kvs))
 
 
 def forward_decode_step(

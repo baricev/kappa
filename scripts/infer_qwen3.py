@@ -109,6 +109,13 @@ def _parse_args() -> argparse.Namespace:
         choices=("gather_einsum", "fixed_capacity", "ragged_jax", "ragged_tokamax"),
         help="MoE expert path for MoE presets (dense models ignore this).",
     )
+    p.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        default=0,
+        metavar="N",
+        help="If N>0 and prompt length > N, prefill in chunks of N (uniform batch lengths or B=1).",
+    )
     return p.parse_args()
 
 
@@ -224,6 +231,7 @@ def main() -> None:
     rng = jax.random.key(args.seed)
     decode_chunk = None if args.decode_chunk_size <= 0 else args.decode_chunk_size
     stop_ids: tuple[int, ...] | None = () if args.no_early_stop else None
+    pfc = args.prefill_chunk_size if args.prefill_chunk_size > 0 else None
     gen = generate(
         rng,
         prompt,
@@ -234,6 +242,7 @@ def main() -> None:
         max_cache_len=max_len,
         temperature=0.0,
         decode_scan_chunk_size=decode_chunk,
+        prefill_chunk_size=pfc,
         stop_token_ids=stop_ids,
         return_timings=args.timings,
         pad_token_id=cfg.pad_token_id,

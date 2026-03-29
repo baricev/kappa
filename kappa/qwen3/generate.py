@@ -18,6 +18,8 @@ from kappa.qwen3.transformer import (
     embed_tokens,
     forward_decode_step,
     forward_prefill,
+    forward_prefill_chunk,
+    init_qwen3_inference_state,
 )
 from kappa.qwen3.weights import Qwen3Params
 
@@ -42,26 +44,74 @@ def generate(
     pad_token_id: int | None = None,
     eos_token_id: int | None = None,
     decode_scan_chunk_size: int | None = 128,
+    prefill_chunk_size: int | None = None,
     stop_token_ids: tuple[int, ...] | None = None,
     return_timings: bool = False,
 ) -> Array | tuple[Array, dict[str, float]]:
-    """Autoregressive generation (same control flow as ``gemma3.generate``)."""
+    """Autoregressive generation (same control flow as ``gemma3.generate``).
+
+    ``prefill_chunk_size``: if set and ``> 0`` and the prompt is longer, run prefill in
+    fixed-size chunks (padding the last chunk). Requires **uniform** valid length per batch
+    row (or batch size 1); otherwise falls back to one-shot prefill.
+    """
     pad = cfg.pad_token_id if pad_token_id is None else pad_token_id
     t_all0 = time.perf_counter()
     valid = (prompt_tokens != pad).astype(jnp.bool_)
     pos0 = positions_from_mask(valid)
 
     t_pf0 = time.perf_counter()
-    _, logits, state = forward_prefill(
-        prompt_tokens,
-        pos0,
-        params=params,
-        cfg=cfg,
-        rope_cache=rope_cache,
-        token_valid_mask=valid,
-        max_len=max_cache_len,
-        last_logits_only=True,
+    b, plen = int(prompt_tokens.shape[0]), int(prompt_tokens.shape[1])
+    fc = prefill_chunk_size
+    lens = jnp.sum(valid, axis=1)
+    uniform = b == 1 or bool(jnp.all(lens == lens[0]))
+    use_chunked = (
+        fc is not None
+        and int(fc) > 0
+        and plen > int(fc)
+        and uniform
     )
+    if use_chunked:
+        dtype = params.embed.dtype
+        state = init_qwen3_inference_state(cfg, batch=b, max_len=max_cache_len, dtype=dtype)
+        fc_i = int(fc)
+        offset = 0
+        logits = None
+        while offset < plen:
+            lc_read = min(fc_i, plen - offset)
+            raw = prompt_tokens[:, offset : offset + lc_read]
+            vraw = valid[:, offset : offset + lc_read]
+            if lc_read < fc_i:
+                pad_tail = jnp.full((b, fc_i - lc_read), pad, dtype=prompt_tokens.dtype)
+                chunk = jnp.concatenate([raw, pad_tail], axis=1)
+                vpad = jnp.zeros((b, fc_i - lc_read), dtype=jnp.bool_)
+                valid_chunk = jnp.concatenate([vraw, vpad], axis=1)
+            else:
+                chunk = raw
+                valid_chunk = vraw
+            true_lens = jnp.sum(valid_chunk, axis=1).astype(jnp.int32)
+            last_chunk = offset + fc_i >= plen
+            _, logits, state = forward_prefill_chunk(
+                chunk,
+                params=params,
+                cfg=cfg,
+                rope_cache=rope_cache,
+                state=state,
+                start_pos=offset,
+                true_chunk_lens=true_lens,
+                last_logits_only=last_chunk,
+            )
+            offset += fc_i
+    else:
+        _, logits, state = forward_prefill(
+            prompt_tokens,
+            pos0,
+            params=params,
+            cfg=cfg,
+            rope_cache=rope_cache,
+            token_valid_mask=valid,
+            max_len=max_cache_len,
+            last_logits_only=True,
+        )
     _block(logits, state)
     prefill_s = time.perf_counter() - t_pf0
 
