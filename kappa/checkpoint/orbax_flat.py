@@ -15,8 +15,35 @@ _logger = logging.getLogger(__name__)
 
 FlatParams = dict[str, jax.Array]
 
+_ENV_RESTORE_CONCURRENT_GB = "KAPPA_ORBAX_RESTORE_CONCURRENT_GB"
 
-def _restore_with_step_tree_metadata(ckptr: ocp.PyTreeCheckpointer, path: Path) -> Any:
+
+def _effective_restore_concurrent_gb(explicit: int | None) -> int | None:
+    """Orbax ``restore_concurrent_gb`` (None = library default, currently large)."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get(_ENV_RESTORE_CONCURRENT_GB, "").strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
+def _pytree_checkpointer(*, restore_concurrent_gb: int | None) -> ocp.Checkpointer:
+    """Match :class:`PyTreeCheckpointer` handler options; optional restore byte cap."""
+    gb = _effective_restore_concurrent_gb(restore_concurrent_gb)
+    handler = ocp.PyTreeCheckpointHandler(
+        use_ocdbt=True,
+        use_zarr3=False,
+        use_compression=True,
+        restore_concurrent_gb=gb,
+    )
+    return ocp.Checkpointer(
+        handler,
+        multiprocessing_options=ocp.options.MultiprocessingOptions(primary_host=0),
+    )
+
+
+def _restore_with_step_tree_metadata(ckptr: ocp.Checkpointer, path: Path) -> Any:
     """Restore using :meth:`Checkpointer.metadata` + explicit local shardings.
 
     Requires a readable PyTree metadata file (Orbax ``_METADATA`` under the step
@@ -48,7 +75,7 @@ def _restore_with_step_tree_metadata(ckptr: ocp.PyTreeCheckpointer, path: Path) 
     )
 
 
-def _restore_with_inferred_structure(ckptr: ocp.PyTreeCheckpointer, path: Path) -> Any:
+def _restore_with_inferred_structure(ckptr: ocp.Checkpointer, path: Path) -> Any:
     """Restore when PyTree ``_METADATA`` is missing but Orbax can infer layout (OCDBT + aggregate).
 
     Uses the same :meth:`PyTreeCheckpointHandler._get_internal_metadata` path as
@@ -85,7 +112,11 @@ def flatten_pytree_to_dict(tree: Any) -> FlatParams:
     return {_path_key_to_str(path): v for path, v in flat}
 
 
-def load_orbax_pytree(path: str | Path) -> Any:
+def load_orbax_pytree(
+    path: str | Path,
+    *,
+    restore_concurrent_gb: int | None = None,
+) -> Any:
     """Restore the checkpoint root as a PyTree (structure depends on how it was saved).
 
     Orbax may log that ``_CHECKPOINT_METADATA`` is missing; that file is optional
@@ -96,10 +127,26 @@ def load_orbax_pytree(path: str | Path) -> Any:
     checkpoints saved elsewhere (e.g. MPS) work on TPU/GPU. If the PyTree
     ``_METADATA`` file is absent, we infer structure from the checkpoint (same as
     Orbax legacy) and still override shardings.
+
+    Args:
+        restore_concurrent_gb: Passed to :class:`ocp.PyTreeCheckpointHandler` as
+            ``restore_concurrent_gb`` to cap in-flight restore bytes (reduces parallel
+            tensor materialization). Use a small value (e.g. 1--4) on TPU if restore
+            hits ``RESOURCE_EXHAUSTED`` / HBM OOM. When ``None``, uses env
+            ``KAPPA_ORBAX_RESTORE_CONCURRENT_GB`` if set, else Orbax default (~96 GiB
+            in-flight), which can overshoot **single-device** HBM for large models.
+
+    Note:
+        Single-device restore still requires the **full** parameter set to fit one
+        chip's HBM. If the model is larger than one device, lowering concurrency only
+        helps peak/transient usage; you need a multi-device mesh and sharded load.
     """
     path = Path(path)
     _logger.info("Restoring Orbax checkpoint from %s", path)
-    ckptr = ocp.PyTreeCheckpointer()
+    ckptr = _pytree_checkpointer(restore_concurrent_gb=restore_concurrent_gb)
+    eff = _effective_restore_concurrent_gb(restore_concurrent_gb)
+    if eff is not None:
+        _logger.info("Orbax restore_concurrent_gb=%s (caps in-flight restore bytes)", eff)
     _step_meta_errors = (
         FileNotFoundError,
         ImportError,
@@ -132,12 +179,13 @@ def load_gemma3_flat_params(
     *,
     dtype: jnp.dtype | None = None,
     drop_siglip: bool = True,
+    restore_concurrent_gb: int | None = None,
 ) -> FlatParams:
     """Load Gemma-3 dense checkpoint keys into a single flat dict (dot-separated paths).
 
     Adapted from the experimental ``gemma-jax`` loader; validate on your checkpoint revision.
     """
-    raw = load_orbax_pytree(path)
+    raw = load_orbax_pytree(path, restore_concurrent_gb=restore_concurrent_gb)
     flat = flatten_pytree_to_dict(raw)
     if drop_siglip:
         flat = {k: v for k, v in flat.items() if not k.startswith("SigLiPFromPatches_0")}

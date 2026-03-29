@@ -116,6 +116,14 @@ def _parse_args() -> argparse.Namespace:
         metavar="N",
         help="If N>0 and prompt length > N, prefill in chunks of N (uniform batch lengths or B=1).",
     )
+    p.add_argument(
+        "--orbax-restore-concurrent-gb",
+        type=int,
+        default=None,
+        metavar="GB",
+        help="Orbax PyTree restore in-flight byte cap (GiB). Lower (e.g. 1--4) if TPU HBM OOM during "
+        "checkpoint read. Env KAPPA_ORBAX_RESTORE_CONCURRENT_GB overrides when this flag is omitted.",
+    )
     return p.parse_args()
 
 
@@ -197,7 +205,12 @@ def main() -> None:
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
 
     print(f"Loading checkpoint from {ckpt} (this can take a while)...", flush=True)
-    cfg, params = load_qwen3_unsharded(ckpt, preset=args.model, dtype=dtype)  # type: ignore[arg-type]
+    cfg, params = load_qwen3_unsharded(
+        ckpt,
+        preset=args.model,
+        dtype=dtype,
+        restore_concurrent_gb=args.orbax_restore_concurrent_gb,
+    )  # type: ignore[arg-type]
     if cfg.use_moe:
         cfg = dataclasses.replace(cfg, moe_impl=args.moe_impl)  # type: ignore[arg-type]
     print(

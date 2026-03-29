@@ -20,13 +20,16 @@ def load_qwen3_flat_params(
     path: str | Path,
     *,
     dtype: jnp.dtype | None = None,
+    restore_concurrent_gb: int | None = None,
 ) -> FlatParams:
     """Load checkpoint root and flatten to dot-separated string keys.
 
     Compatible with checkpoints produced via Simply's ``hf_to_orbax`` + ``Qwen2Format``
     (plus ``LegacyFormat`` transforms).
+
+    ``restore_concurrent_gb``: see :func:`load_orbax_pytree`.
     """
-    raw = load_orbax_pytree(path)
+    raw = load_orbax_pytree(path, restore_concurrent_gb=restore_concurrent_gb)
     flat = flatten_pytree_to_dict(raw)
     flat = _normalize_flat_keys(flat)
     if dtype is not None:

@@ -18,9 +18,12 @@ def load_qwen3_unsharded(
     preset: ModelPreset,
     dtype: jnp.dtype | None = None,
     config: Qwen3Config | None = None,
+    restore_concurrent_gb: int | None = None,
 ) -> tuple[Qwen3Config, Qwen3Params]:
     cfg = config or qwen3_config_for_preset(preset)
-    flat = load_qwen3_flat_params(checkpoint_dir, dtype=dtype)
+    flat = load_qwen3_flat_params(
+        checkpoint_dir, dtype=dtype, restore_concurrent_gb=restore_concurrent_gb
+    )
     if is_huggingface_flat(flat):
         params = hf_flat_to_qwen3_params(flat, cfg, preset=preset)
     else:
