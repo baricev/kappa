@@ -26,6 +26,7 @@ from jax import Array
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from kappa.qwen3.architecture import Qwen3Config
+from kappa.qwen3.quant import Q8Weight
 from kappa.qwen3.weights import (
     AttnParams,
     DenseFfnParams,
@@ -33,6 +34,7 @@ from kappa.qwen3.weights import (
     Qwen3DenseBlockParams,
     Qwen3MoEBlockParams,
     Qwen3Params,
+    quantize_qwen3_params,
 )
 
 _logger = logging.getLogger(__name__)
@@ -102,29 +104,35 @@ def qwen3_params_pspec(cfg: Qwen3Config, mesh: Mesh) -> Qwen3Params:
     """PartitionSpec tree matching :class:`Qwen3Params` (see module doc for MoE caveats)."""
     t = _axis_name_tensor(mesh)
     _rep = P()
+    q8 = cfg.quantization == "w8"
+
+    def wps(ps: P) -> P | Q8Weight:
+        if not q8:
+            return ps
+        return Q8Weight(values=ps, scale=_rep)
 
     nh = cfg.num_heads
     nkv = cfg.num_kv_heads
 
     def attn_pspec() -> AttnParams:
         return AttnParams(
-            _shard_leading_if_divisible(mesh, nh, 3),
-            _shard_leading_if_divisible(mesh, nkv, 3),
-            _shard_leading_if_divisible(mesh, nkv, 3),
-            _shard_leading_if_divisible(mesh, nh, 3),
+            wps(_shard_leading_if_divisible(mesh, nh, 3)),
+            wps(_shard_leading_if_divisible(mesh, nkv, 3)),
+            wps(_shard_leading_if_divisible(mesh, nkv, 3)),
+            wps(_shard_leading_if_divisible(mesh, nh, 3)),
             _rep,
             _rep,
         )
 
     def dense_ffn_pspec() -> DenseFfnParams:
         return DenseFfnParams(
-            P(None, t),  # [model_dim, intermediate] shard intermediate
-            P(None, t),
-            P(t, None),
+            wps(P(None, t)),  # [model_dim, intermediate] shard intermediate
+            wps(P(None, t)),
+            wps(P(t, None)),
         )
 
     def moe_ffn_pspec() -> MoEFfnParams:
-        return MoEFfnParams(router=_rep, gate_proj=_rep, up_proj=_rep, down_proj=_rep)
+        return MoEFfnParams(router=wps(_rep), gate_proj=wps(_rep), up_proj=wps(_rep), down_proj=wps(_rep))
 
     blocks: list[Qwen3DenseBlockParams | Qwen3MoEBlockParams] = []
     for _ in range(cfg.num_layers):
@@ -135,8 +143,8 @@ def qwen3_params_pspec(cfg: Qwen3Config, mesh: Mesh) -> Qwen3Params:
             blocks.append(Qwen3DenseBlockParams(_rep, _rep, ap, dense_ffn_pspec()))
 
     vocab = cfg.vocab_size
-    emb_ps = _shard_leading_if_divisible(mesh, vocab, 2)
-    lm_ps: P | None = None if cfg.use_tied_embedding else _shard_leading_if_divisible(mesh, vocab, 2)
+    emb_ps = wps(_shard_leading_if_divisible(mesh, vocab, 2))
+    lm_ps: P | Q8Weight | None = None if cfg.use_tied_embedding else wps(_shard_leading_if_divisible(mesh, vocab, 2))
 
     return Qwen3Params(
         embed=emb_ps,
@@ -182,6 +190,9 @@ def load_qwen3_sharded(
         restore_arrays_as_numpy=True,
     )
     params = params_from_flat(flat, num_layers=cfg.num_layers, use_moe=cfg.use_moe)
+    if cfg.quantization == "w8":
+        sd = dtype if dtype is not None else jnp.bfloat16
+        params = quantize_qwen3_params(params, scale_dtype=sd)
     pspec = qwen3_params_pspec(cfg, mesh)
     with mesh:
         out = device_put_qwen3_params(params, pspec, mesh)

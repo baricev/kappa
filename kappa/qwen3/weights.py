@@ -7,12 +7,18 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import Array
 
+from kappa.qwen3.quant import Q8Weight, Weight, quantize_weight
+
 # Local alias avoids importing ``kappa.checkpoint`` (package ``__init__`` pulls ``qwen_hf_convert``
 # → ``weights``) when this module is loaded from ``sharding`` or other early imports.
 FlatParams = dict[str, Array]
 
 
-def normalize_lm_head_for_logits(embed: Array, lm_head: Array | None) -> Array | None:
+def _weight_shape(w: Weight) -> tuple[int, ...]:
+    return w.values.shape if isinstance(w, Q8Weight) else w.shape
+
+
+def normalize_lm_head_for_logits(embed: Weight, lm_head: Weight | None) -> Weight | None:
     """``logits_from_hidden`` uses ``einsum(..., vd)`` with ``v=vocab``, ``d=model_dim``.
 
     HuggingFace ``lm_head.weight`` is ``[vocab, model_dim]``. Simply ``output_layer/w`` is often
@@ -20,37 +26,40 @@ def normalize_lm_head_for_logits(embed: Array, lm_head: Array | None) -> Array |
     """
     if lm_head is None:
         return None
-    v_sz, d_sz = embed.shape[0], embed.shape[1]
-    if lm_head.shape[0] == v_sz and lm_head.shape[1] == d_sz:
+    v_sz, d_sz = _weight_shape(embed)[0], _weight_shape(embed)[1]
+    ls = _weight_shape(lm_head)
+    if ls[0] == v_sz and ls[1] == d_sz:
         return lm_head
-    if lm_head.shape[0] == d_sz and lm_head.shape[1] == v_sz:
+    if ls[0] == d_sz and ls[1] == v_sz:
+        if isinstance(lm_head, Q8Weight):
+            return Q8Weight(values=jnp.transpose(lm_head.values), scale=lm_head.scale)
         return jnp.transpose(lm_head)
     raise ValueError(
-        f"lm_head shape {lm_head.shape} does not match embed table {tuple(embed.shape)} "
+        f"lm_head shape {ls} does not match embed table {(v_sz, d_sz)} "
         "as [vocab, dim] or [dim, vocab]."
     )
 
 
 class AttnParams(NamedTuple):
-    q_proj: Array
-    k_proj: Array
-    v_proj: Array
-    o_proj: Array
+    q_proj: Weight
+    k_proj: Weight
+    v_proj: Weight
+    o_proj: Weight
     q_norm_scale: Array
     k_norm_scale: Array
 
 
 class DenseFfnParams(NamedTuple):
-    gate_proj: Array
-    up_proj: Array
-    down_proj: Array
+    gate_proj: Weight
+    up_proj: Weight
+    down_proj: Weight
 
 
 class MoEFfnParams(NamedTuple):
-    router: Array
-    gate_proj: Array
-    up_proj: Array
-    down_proj: Array
+    router: Weight
+    gate_proj: Weight
+    up_proj: Weight
+    down_proj: Weight
 
 
 class Qwen3DenseBlockParams(NamedTuple):
@@ -68,10 +77,10 @@ class Qwen3MoEBlockParams(NamedTuple):
 
 
 class Qwen3Params(NamedTuple):
-    embed: Array
+    embed: Weight
     final_norm: Array
     blocks: tuple[Qwen3DenseBlockParams | Qwen3MoEBlockParams, ...]
-    lm_head: Array | None  # if not tied
+    lm_head: Weight | None  # if not tied
 
 
 def params_from_flat(
@@ -129,3 +138,51 @@ def params_from_flat(
 
     lm_head = normalize_lm_head_for_logits(embed, lm_head)
     return Qwen3Params(embed=embed, final_norm=final_norm, blocks=tuple(blocks), lm_head=lm_head)
+
+
+def quantize_qwen3_params(params: Qwen3Params, *, scale_dtype: jnp.dtype = jnp.bfloat16) -> Qwen3Params:
+    """PTQ: linear weights → :class:`Q8Weight`; RMS norm scales stay full precision."""
+
+    def q(w: Weight) -> Q8Weight:
+        if isinstance(w, Q8Weight):
+            return w
+        return quantize_weight(w, scale_dtype=scale_dtype)
+
+    def attn(a: AttnParams) -> AttnParams:
+        return AttnParams(
+            q_proj=q(a.q_proj),
+            k_proj=q(a.k_proj),
+            v_proj=q(a.v_proj),
+            o_proj=q(a.o_proj),
+            q_norm_scale=a.q_norm_scale,
+            k_norm_scale=a.k_norm_scale,
+        )
+
+    def dense_ffn(f: DenseFfnParams) -> DenseFfnParams:
+        return DenseFfnParams(gate_proj=q(f.gate_proj), up_proj=q(f.up_proj), down_proj=q(f.down_proj))
+
+    def moe_ffn(f: MoEFfnParams) -> MoEFfnParams:
+        return MoEFfnParams(
+            router=q(f.router),
+            gate_proj=q(f.gate_proj),
+            up_proj=q(f.up_proj),
+            down_proj=q(f.down_proj),
+        )
+
+    new_blocks: list[Qwen3DenseBlockParams | Qwen3MoEBlockParams] = []
+    for b in params.blocks:
+        ap = attn(b.attn)
+        if isinstance(b, Qwen3MoEBlockParams):
+            new_blocks.append(Qwen3MoEBlockParams(b.pre_attn_norm, b.pre_ffn_norm, ap, moe_ffn(b.ffn)))
+        else:
+            new_blocks.append(Qwen3DenseBlockParams(b.pre_attn_norm, b.pre_ffn_norm, ap, dense_ffn(b.ffn)))
+
+    lm = params.lm_head
+    lm_q = None if lm is None else q(lm)
+
+    return Qwen3Params(
+        embed=q(params.embed),
+        final_norm=params.final_norm,
+        blocks=tuple(new_blocks),
+        lm_head=lm_q,
+    )

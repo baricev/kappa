@@ -10,7 +10,16 @@ from jax.sharding import Mesh
 from kappa.checkpoint.qwen_hf_convert import hf_flat_to_qwen3_params, is_huggingface_flat
 from kappa.checkpoint.qwen_flat import load_qwen3_flat_params
 from kappa.qwen3.architecture import ModelPreset, Qwen3Config, qwen3_config_for_preset
-from kappa.qwen3.weights import Qwen3Params, params_from_flat
+from kappa.qwen3.weights import Qwen3Params, params_from_flat, quantize_qwen3_params
+
+
+def _maybe_quantize(
+    cfg: Qwen3Config, params: Qwen3Params, dtype: jnp.dtype | None
+) -> Qwen3Params:
+    if cfg.quantization != "w8":
+        return params
+    scale_dtype = dtype if dtype is not None else jnp.bfloat16
+    return quantize_qwen3_params(params, scale_dtype=scale_dtype)
 
 
 def load_qwen3_unsharded(
@@ -31,6 +40,7 @@ def load_qwen3_unsharded(
         params = params_from_flat(flat, num_layers=cfg.num_layers, use_moe=cfg.use_moe)
     if not cfg.use_tied_embedding and params.lm_head is None:
         raise ValueError("untied model requires output_layer.w in checkpoint")
+    params = _maybe_quantize(cfg, params, dtype)
     return cfg, params
 
 

@@ -17,6 +17,7 @@ from kappa.qwen3.block import (
 )
 from kappa.qwen3.rope import RopeCache
 from kappa.qwen3.norms import rms_norm
+from kappa.qwen3.quant import Weight, gather_embed_tokens, is_q8_weight, to_compute_dtype
 from kappa.qwen3.weights import Qwen3Params
 
 
@@ -45,31 +46,33 @@ def init_qwen3_inference_state(
     )
 
 
-def embed_tokens(tokens: Array, embed_table: Array) -> Array:
-    t = tokens.astype(jnp.int32)
-    et = embed_table if isinstance(embed_table, Array) else jnp.asarray(embed_table)
-    return et[t]
+def embed_tokens(tokens: Array, embed_table: Weight, *, compute_dtype: jnp.dtype | None = None) -> Array:
+    if compute_dtype is None:
+        compute_dtype = embed_table.scale.dtype if is_q8_weight(embed_table) else embed_table.dtype
+    return gather_embed_tokens(tokens, embed_table, compute_dtype=compute_dtype)
 
 
-def logits_from_hidden(x: Array, lm_head: Array) -> Array:
+def logits_from_hidden(x: Array, lm_head: Weight) -> Array:
     """``lm_head`` ``[vocab, model_dim]``."""
-    et = lm_head if isinstance(lm_head, Array) else jnp.asarray(lm_head)
+    et = to_compute_dtype(lm_head, x.dtype)
     dt = jnp.promote_types(x.dtype, et.dtype)
     return jnp.einsum("btd,vd->btv", x.astype(dt), et.astype(dt))
 
 
-def logits_from_hidden_tied(x: Array, embed_table: Array) -> Array:
-    dt = jnp.promote_types(x.dtype, embed_table.dtype)
-    return jnp.einsum("btd,vd->btv", x.astype(dt), embed_table.astype(dt))
+def logits_from_hidden_tied(x: Array, embed_table: Weight) -> Array:
+    et = to_compute_dtype(embed_table, x.dtype)
+    dt = jnp.promote_types(x.dtype, et.dtype)
+    return jnp.einsum("btd,vd->btv", x.astype(dt), et.astype(dt))
 
 
-def logits_from_hidden_last_positions(x: Array, w: Array, last_idx: Array) -> Array:
+def logits_from_hidden_last_positions(x: Array, w: Weight, last_idx: Array) -> Array:
     """``x`` ``[B, L, D]``; last valid index per row ``[B]`` -> logits ``[B, V]``."""
     b = x.shape[0]
     rows = jnp.arange(b, dtype=jnp.int32)
     h = x[rows, last_idx, :]
-    dt = jnp.promote_types(h.dtype, w.dtype)
-    return jnp.einsum("bd,vd->bv", h.astype(dt), w.astype(dt))
+    wt = to_compute_dtype(w, h.dtype)
+    dt = jnp.promote_types(h.dtype, wt.dtype)
+    return jnp.einsum("bd,vd->bv", h.astype(dt), wt.astype(dt))
 
 
 def forward_prefill(

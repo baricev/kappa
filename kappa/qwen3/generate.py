@@ -14,6 +14,7 @@ from kappa.gemma3.sampling import sample_from_logits
 from kappa.qwen3.architecture import Qwen3Config
 from kappa.qwen3.rope import RopeCache
 from kappa.qwen3.special_tokens import QWEN3_EOS
+from kappa.qwen3.quant import weight_param_dtype
 from kappa.qwen3.transformer import (
     embed_tokens,
     forward_decode_step,
@@ -71,7 +72,7 @@ def generate(
         and uniform
     )
     if use_chunked:
-        dtype = params.embed.dtype
+        dtype = weight_param_dtype(params.embed)
         state = init_qwen3_inference_state(cfg, batch=b, max_len=max_cache_len, dtype=dtype)
         fc_i = int(fc)
         offset = 0

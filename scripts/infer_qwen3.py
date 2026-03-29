@@ -22,6 +22,7 @@ import argparse
 import dataclasses
 import sys
 from pathlib import Path
+from typing import cast
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -132,6 +133,14 @@ def _parse_args() -> argparse.Namespace:
         help="none: single-device load. auto: (1,N) device mesh, numpy Orbax restore, then "
         "tensor-parallel PartitionSpec + jax.device_put (see kappa.qwen3.sharding).",
     )
+    p.add_argument(
+        "--quant",
+        type=str,
+        default="none",
+        choices=("none", "w8"),
+        help="none: bf16/fp32 weights. w8: PTQ symmetric int8 + scalar scale after load "
+        "(kappa.qwen3.quant); set cfg.quantization for sharded pspec.",
+    )
     return p.parse_args()
 
 
@@ -205,12 +214,17 @@ def main() -> None:
     import jax
     import jax.numpy as jnp
 
+    from kappa.qwen3.architecture import QuantMode, qwen3_config_for_preset
     from kappa.qwen3.generate import generate
     from kappa.qwen3.load import load_qwen3_for_mesh, load_qwen3_unsharded
     from kappa.qwen3.rope import build_qwen3_rope_cache
     from kappa.qwen3.special_tokens import QWEN3_EOS
 
     dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
+    user_cfg = dataclasses.replace(
+        qwen3_config_for_preset(args.model),  # type: ignore[arg-type]
+        quantization=cast(QuantMode, args.quant),
+    )
 
     print(f"Loading checkpoint from {ckpt} (this can take a while)...", flush=True)
     mesh = None
@@ -223,6 +237,7 @@ def main() -> None:
             mesh,
             preset=args.model,  # type: ignore[arg-type]
             dtype=dtype,
+            config=user_cfg,
             restore_concurrent_gb=args.orbax_restore_concurrent_gb,
         )
         print(
@@ -234,6 +249,7 @@ def main() -> None:
             ckpt,
             preset=args.model,
             dtype=dtype,
+            config=user_cfg,
             restore_concurrent_gb=args.orbax_restore_concurrent_gb,
         )  # type: ignore[arg-type]
     if cfg.use_moe:
@@ -244,6 +260,8 @@ def main() -> None:
     )
     if cfg.use_moe:
         print(f"  moe_impl={cfg.moe_impl}", flush=True)
+    if cfg.quantization != "none":
+        print(f"  quantization={cfg.quantization}", flush=True)
 
     max_len = args.max_cache_len
     rope_cache = build_qwen3_rope_cache(cfg, max_seq_len=max_len)

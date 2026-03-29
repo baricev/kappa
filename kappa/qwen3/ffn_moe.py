@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from jax import Array
 
 from kappa.qwen3.architecture import MoEImpl, Qwen3Config
+from kappa.qwen3.quant import Weight, is_q8_weight, moe_take_dequant, to_compute_dtype
 
 # Upper bound on B*T when deriving static fixed_capacity buffer width (slots per expert).
 _MOE_FIXED_CAP_MAX_BT = 8192
@@ -30,18 +31,23 @@ def _fixed_capacity_buffer_slots(cfg: Qwen3Config) -> int:
     return max(1, int(math.ceil(cap)))
 
 
+def _expert_count(ffn_w: Weight) -> int:
+    return int(ffn_w.values.shape[0] if is_q8_weight(ffn_w) else ffn_w.shape[0])
+
+
 def _route(
     x: Array,
-    router_w: Array,
+    router_w: Weight,
     *,
     num_experts: int,
     num_experts_per_tok: int,
 ) -> tuple[Array, Array, Array, int, int, int]:
     d = x.shape[-1]
-    if router_w.shape != (d, num_experts):
-        raise ValueError(f"router_w shape {router_w.shape} != ({d}, {num_experts})")
+    rw = to_compute_dtype(router_w, jnp.float32)
+    if rw.shape != (d, num_experts):
+        raise ValueError(f"router_w shape {rw.shape} != ({d}, {num_experts})")
     b, t, _ = x.shape
-    logits = jnp.einsum("btd,de->bte", x.astype(jnp.float32), router_w.astype(jnp.float32))
+    logits = jnp.einsum("btd,de->bte", x.astype(jnp.float32), rw.astype(jnp.float32))
     top_logits, top_idx = jax.lax.top_k(logits, k=num_experts_per_tok)
     weights = jax.nn.softmax(top_logits, axis=-1).astype(x.dtype)
     x_flat = jnp.reshape(x, (b * t, d))
@@ -69,26 +75,26 @@ def _moe_gather_einsum(
     x_flat: Array,
     idx: Array,
     w: Array,
-    ffn_gate: Array,
-    ffn_up: Array,
-    ffn_down: Array,
+    ffn_gate: Weight,
+    ffn_up: Weight,
+    ffn_down: Weight,
     *,
     num_experts_per_tok: int,
     b: int,
     t: int,
     d: int,
 ) -> Array:
-    e = ffn_gate.shape[0]
+    e = _expert_count(ffn_gate)
     bt = b * t
     idx_flat = jnp.reshape(idx, (-1,))
-    w0 = jnp.take(ffn_gate, jnp.clip(idx_flat, 0, e - 1), axis=0).reshape(
-        bt, num_experts_per_tok, *ffn_gate.shape[1:]
+    w0 = moe_take_dequant(
+        ffn_gate, idx_flat, e=e, num_experts_per_tok=num_experts_per_tok, bt=bt, dtype=x_flat.dtype
     )
-    wu = jnp.take(ffn_up, jnp.clip(idx_flat, 0, e - 1), axis=0).reshape(
-        bt, num_experts_per_tok, *ffn_up.shape[1:]
+    wu = moe_take_dequant(
+        ffn_up, idx_flat, e=e, num_experts_per_tok=num_experts_per_tok, bt=bt, dtype=x_flat.dtype
     )
-    wd = jnp.take(ffn_down, jnp.clip(idx_flat, 0, e - 1), axis=0).reshape(
-        bt, num_experts_per_tok, *ffn_down.shape[1:]
+    wd = moe_take_dequant(
+        ffn_down, idx_flat, e=e, num_experts_per_tok=num_experts_per_tok, bt=bt, dtype=x_flat.dtype
     )
     g = jnp.einsum("bd,bkdi->bki", x_flat, w0)
     u = jnp.einsum("bd,bkdi->bki", x_flat, wu)
@@ -102,9 +108,9 @@ def _moe_fixed_capacity(
     x_flat: Array,
     idx: Array,
     w: Array,
-    ffn_gate: Array,
-    ffn_up: Array,
-    ffn_down: Array,
+    ffn_gate: Weight,
+    ffn_up: Weight,
+    ffn_down: Weight,
     *,
     num_experts: int,
     num_experts_per_tok: int,
@@ -137,10 +143,13 @@ def _moe_fixed_capacity(
     buf = jnp.zeros((e, capacity_slots, d), dtype=x_flat.dtype)
     safe_s = jnp.where(valid, slot, jnp.int32(0))
     buf = buf.at[sorted_e, safe_s].add(jnp.where(valid[:, None], sorted_x, jnp.zeros_like(sorted_x)))
-    g = jnp.einsum("ecd,edi->eci", buf, ffn_gate)
-    u = jnp.einsum("ecd,edi->eci", buf, ffn_up)
+    gate_f = to_compute_dtype(ffn_gate, x_flat.dtype)
+    up_f = to_compute_dtype(ffn_up, x_flat.dtype)
+    down_f = to_compute_dtype(ffn_down, x_flat.dtype)
+    g = jnp.einsum("ecd,edi->eci", buf, gate_f)
+    u = jnp.einsum("ecd,edi->eci", buf, up_f)
     h = jax.nn.silu(g) * u
-    y_b = jnp.einsum("eci,eid->ecd", h, ffn_down)
+    y_b = jnp.einsum("eci,eid->ecd", h, down_f)
     y_pick = jnp.where(valid[:, None], y_b[sorted_e, safe_s], jnp.zeros((m, d), dtype=x_flat.dtype))
     inv = jnp.zeros(m, dtype=jnp.int32).at[order].set(jnp.arange(m, dtype=jnp.int32))
     y_assign = y_pick[inv]
@@ -166,9 +175,9 @@ def _moe_ragged(
     x_flat: Array,
     idx: Array,
     w: Array,
-    ffn_gate: Array,
-    ffn_up: Array,
-    ffn_down: Array,
+    ffn_gate: Weight,
+    ffn_up: Weight,
+    ffn_down: Weight,
     *,
     num_experts: int,
     num_experts_per_tok: int,
@@ -191,9 +200,9 @@ def _moe_ragged(
     group_sizes = jnp.bincount(sorted_e, length=num_experts).astype(jnp.int32)
 
     lhs_f = sorted_x.astype(jnp.float32)
-    wg = ffn_gate.astype(jnp.float32)
-    wu = ffn_up.astype(jnp.float32)
-    wd = ffn_down.astype(jnp.float32)
+    wg = to_compute_dtype(ffn_gate, jnp.float32)
+    wu = to_compute_dtype(ffn_up, jnp.float32)
+    wd = to_compute_dtype(ffn_down, jnp.float32)
 
     g_out = _ragged_dot(lhs_f, wg, group_sizes, prefer_tokamax=prefer_tokamax)
     u_out = _ragged_dot(lhs_f, wu, group_sizes, prefer_tokamax=prefer_tokamax)
@@ -216,10 +225,10 @@ def _effective_moe_impl(cfg: Qwen3Config, *, total_tokens: int) -> MoEImpl:
 
 def moe_swiglu_ffn(
     x: Array,
-    router_w: Array,
-    ffn_gate: Array,
-    ffn_up: Array,
-    ffn_down: Array,
+    router_w: Weight,
+    ffn_gate: Weight,
+    ffn_up: Weight,
+    ffn_down: Weight,
     *,
     cfg: Qwen3Config,
 ) -> Array:
@@ -292,10 +301,10 @@ def moe_swiglu_ffn(
 
 def moe_swiglu_ffn_legacy(
     x: Array,
-    router_w: Array,
-    ffn_gate: Array,
-    ffn_up: Array,
-    ffn_down: Array,
+    router_w: Weight,
+    ffn_gate: Weight,
+    ffn_up: Weight,
+    ffn_down: Weight,
     *,
     num_experts: int,
     num_experts_per_tok: int,

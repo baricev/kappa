@@ -13,6 +13,8 @@ ModelPreset = Literal[
 
 MoEImpl = Literal["gather_einsum", "fixed_capacity", "ragged_jax", "ragged_tokamax"]
 
+QuantMode = Literal["none", "w8"]
+
 
 @dataclass(frozen=True, slots=True)
 class Qwen3Config:
@@ -45,6 +47,8 @@ class Qwen3Config:
     # capacity for all forwards (see ffn_moe). Override for long unchunked prefill or huge factors.
     moe_fixed_capacity_slots: int | None = None
     moe_ragged_decode_token_threshold: int = 64
+    # PTQ-style W8 (int8 + scalar scale); see ``kappa.qwen3.quant``
+    quantization: QuantMode = "none"
 
 
 def qwen3_config_for_preset(preset: ModelPreset) -> Qwen3Config:

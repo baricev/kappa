@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from kappa.qwen3.architecture import Qwen3Config
+from kappa.qwen3.quant import weight_param_dtype
 from kappa.qwen3.rope import build_qwen3_rope_cache
 from kappa.qwen3.transformer import (
     forward_prefill,
@@ -104,7 +105,7 @@ def main() -> None:
         last_logits_only=True,
     )
 
-    state0 = init_qwen3_inference_state(cfg, batch=1, max_len=max_len, dtype=params.embed.dtype)
+    state0 = init_qwen3_inference_state(cfg, batch=1, max_len=max_len, dtype=weight_param_dtype(params.embed))
     offset = 0
     logits_c = None
     st_c = state0
